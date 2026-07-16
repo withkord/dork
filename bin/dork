@@ -27,7 +27,7 @@
 #
 set -euo pipefail
 
-DORK_VERSION="0.1.0"
+DORK_VERSION="0.2.0"
 
 # Absolute path of this script + the dork checkout that contains it.
 _SRC="${BASH_SOURCE[0]}"
@@ -62,9 +62,13 @@ Usage: $PROG <command>
                commit message and gh fills the PR from commits.
   kill [P …]   Stop the dev server, remove worktree(s), delete branch(es).
                No args: current worktree. Port args: those, in parallel.
-  init         Set up this repo: write .dork.sh config, gitignore entries,
+  init [--permissions|--no-permissions]
+               Set up this repo: write .dork.sh config, gitignore entries,
                and the Claude Code worktree-guard hook. Commit the results so
-               teammates get them for free.
+               teammates get them for free. --permissions also merges a
+               starter allow/deny permission set into .claude/settings.json
+               (deny rules guard destructive git even in yolo mode); with
+               neither flag, an interactive run asks.
   flow         Print the daily-flow cheat sheet (worktree → PR → merge → sync).
   update       Update dork itself (git pull in $DORK_HOME).
   version      Print the dork version.
@@ -1037,9 +1041,77 @@ EOF
 
 # --- init --------------------------------------------------------------------
 
+# Merge the starter Claude Code permission set (claude/permissions.json in
+# the dork checkout) into the repo's .claude/settings.json. Additive only:
+# existing entries are never removed or reordered. The allow list cuts
+# permission prompts in normal mode; the deny list blocks destructive git
+# (force-pushing/deleting the trunk, clean -f, reset --hard, stash, push)
+# and keeps applying even in yolo mode — deny rules aren't skipped by
+# --dangerously-skip-permissions.
+merge_starter_permissions() {
+  local starter="$DORK_HOME/claude/permissions.json"
+  if [[ ! -f "$starter" ]]; then
+    echo >&2 "[dork] Starter permissions not found at $starter — run '$PROG update'."
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo >&2 "[dork] python3 not found — skipped the permission set."
+    return 1
+  fi
+  if REPO_ROOT="$REPO_ROOT" STARTER="$starter" python3 - <<'PYEOF'
+import json, os, sys
+
+with open(os.environ["STARTER"]) as f:
+    starter = json.load(f)["permissions"]
+
+path = os.path.join(os.environ["REPO_ROOT"], ".claude", "settings.json")
+settings = {}
+if os.path.exists(path):
+    with open(path) as f:
+        settings = json.load(f)
+
+perms = settings.setdefault("permissions", {})
+added = 0
+for key in ("allow", "deny"):
+    existing = perms.setdefault(key, [])
+    have = set(existing)
+    for entry in starter.get(key, []):
+        if entry not in have:
+            existing.append(entry)
+            added += 1
+
+if added == 0:
+    sys.exit(1)  # everything already present
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+print(added)
+PYEOF
+  then
+    echo "[dork] Merged the starter permission set into .claude/settings.json"
+    return 0
+  else
+    echo "[dork] Starter permission set already present — nothing to add."
+    return 1
+  fi
+}
+
 # Set up the current repo for dork. Everything init writes is meant to be
 # COMMITTED, so teammates who install dork need zero per-repo setup.
+# --permissions / --no-permissions control the starter Claude Code permission
+# set; with neither flag, an interactive run asks.
 cmd_init() {
+  local perms="ask" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --permissions)    perms="yes" ;;
+      --no-permissions) perms="no" ;;
+      *) echo >&2 "[dork] Unknown init option: $arg"; exit 1 ;;
+    esac
+  done
+
   local wrote=""
 
   # 1. Project config
@@ -1148,6 +1220,27 @@ PYEOF
     fi
   fi
 
+  # 4. Starter Claude Code permission set (opt-in)
+  if [[ "$perms" == "ask" ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      printf '[dork] Add the starter Claude Code permission set to .claude/settings.json?\n'
+      printf '       (allow: common dev commands without prompts; deny: destructive git —\n'
+      printf '        denies keep applying even in yolo mode) [y/N] '
+      local answer=""
+      read -r answer || true
+      case "$answer" in
+        y|Y|yes|YES) perms="yes" ;;
+        *)           perms="no" ;;
+      esac
+    else
+      perms="no"
+      echo "[dork] Skipped the starter permission set (add later with '$PROG init --permissions')."
+    fi
+  fi
+  if [[ "$perms" == "yes" ]]; then
+    merge_starter_permissions && wrote=1
+  fi
+
   echo
   if [[ -n "$wrote" ]]; then
     echo "[dork] Done. Review + commit: .dork.sh .gitignore .claude/"
@@ -1181,7 +1274,7 @@ case "$1" in
   sync)        shift; repo_required; cmd_sync "$@" ;;
   pr)          shift; repo_required; cmd_pr "$@" ;;
   kill)        shift; repo_required; cmd_kill "$@" ;;
-  init)        shift; repo_required; cmd_init ;;
+  init)        shift; repo_required; cmd_init "$@" ;;
   flow)        require_repo || { BASE_PORT=3001; MAX_PORT=3008; }; cmd_flow ;;
   update)      cmd_update ;;
   version|--version|-v) echo "dork $DORK_VERSION" ;;

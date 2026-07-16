@@ -50,6 +50,28 @@ dork need zero extra setup:
 Branches are named `<prefix>/<port>`. The prefix defaults to your login name;
 set your own once with `git config --global dork.branch-prefix yourname`.
 
+### Optional: starter Claude Code permissions
+
+```sh
+dork init --permissions
+```
+
+Merges a starter permission set into `.claude/settings.json` (additive only —
+your existing entries are never removed). Two halves:
+
+- **allow** — common read-only and dev commands (`ls`, `grep`, `git`, `gh`,
+  `pnpm`, `node`, …) plus file edits run without permission prompts in normal
+  mode. It's a permissive, agent-friendly baseline — trim it to taste.
+- **deny** — destructive git is blocked: force-pushing or deleting the trunk,
+  `git clean -f`, `git reset --hard`, `git stash`, and `git push` entirely
+  (in the dork flow the agent edits and commits; *you* run `dork pr`).
+  **Deny rules keep applying in yolo mode** — `--dangerously-skip-permissions`
+  skips prompts, not denies — which is what makes `dork yolo` sane.
+
+The set lives in [`claude/permissions.json`](claude/permissions.json). A bare
+`dork init` run interactively asks whether to add it; in scripts it defaults
+to off (`--no-permissions` silences the question).
+
 ## Daily flow
 
 ```
@@ -88,7 +110,7 @@ worktree: resolve there, `git rebase --continue`, re-run sync.
 | `dork sync [all\|P …]` | Rebase worktree branch(es) onto the latest trunk (see above). |
 | `dork pr [title]` | Commit pending changes, push, open a GitHub PR, open its page. |
 | `dork kill [P …]` | Stop dev server(s), remove worktree(s), delete branch(es). |
-| `dork init` | Set up the current repo (config, gitignore, Claude guard hook). |
+| `dork init [--permissions]` | Set up the current repo (config, gitignore, Claude guard hook, optional permission set). |
 | `dork flow` | Print the daily-flow cheat sheet. |
 | `dork update` | Update dork itself. |
 
