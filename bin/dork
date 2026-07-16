@@ -1,0 +1,1190 @@
+#!/usr/bin/env bash
+#
+# dork — parallel git worktrees for agentic coding.
+#
+# Each worktree gets its own branch, port, dev server, and coding agent
+# (Claude Code by default), tiled in your terminal (Ghostty or tmux).
+# A linear-history PR flow keeps every worktree in step with the trunk.
+#
+#   dork new [N]    — new worktree; dev server pane + shell pane + agent here;
+#                     with N: create N worktrees tiled in the terminal
+#   dork yolo [N]   — same as new, but the agent skips permission prompts
+#   dork sync [all|P …] — rebase branch(es) onto the latest trunk (see FLOW)
+#   dork pr [title] — commit pending changes, push, open a PR (gh pr create)
+#   dork kill [P …] — kill worktree(s) + branch(es); no args: current worktree
+#   dork init       — set up the current repo for dork (config, gitignore, hook)
+#   dork flow       — print the daily-flow cheat sheet
+#   dork update     — update dork itself (git pull in its checkout)
+#
+# FLOW — plain git + gh, linear history everywhere: sync always REBASES onto
+# the trunk, so no "Merge branch …" commits. A branch that has been pushed
+# gets `git push --force-with-lease` right after its rebase so
+# origin/<branch> (and the PR) follows the rewrite; the lease means the push
+# is refused — never clobbered — if the remote branch grew commits you
+# haven't fetched. After a PR squash-merges, the branch is *reset* to the
+# fresh trunk; a surviving origin/<branch> is realigned to the new tip so the
+# branch stays alive between PRs.
+#
+set -euo pipefail
+
+DORK_VERSION="0.1.0"
+
+# Absolute path of this script + the dork checkout that contains it.
+_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_SRC" ]]; do
+  _DIR="$(cd "$(dirname "$_SRC")" && pwd)"
+  _SRC="$(readlink "$_SRC")"
+  [[ "$_SRC" != /* ]] && _SRC="$_DIR/$_SRC"
+done
+DORK_BIN="$(cd "$(dirname "$_SRC")" && pwd)/$(basename "$_SRC")"
+DORK_HOME="$(cd "$(dirname "$DORK_BIN")/.." && pwd)"
+
+PROG="${DORK_PROG:-dork}"
+
+usage() {
+  cat <<EOF
+Usage: $PROG <command>
+
+  new [N]      Worktree + deps; dev server pane, shell pane, agent in this one.
+               With N: create N worktrees tiled in the terminal (Ghostty: 2 or
+               4; tmux: 2-8).
+  yolo [N]     Same as new, but the agent skips permission prompts
+               (claude --dangerously-skip-permissions).
+  sync [all|P …]
+               Pull the trunk, then rebase branch(es) onto it: fast-forward
+               when possible, reset after a squash-merged PR, otherwise
+               rebase; a pushed branch is then pushed with --force-with-lease
+               so its PR follows. No args: current worktree. 'all': every
+               worktree. Ports: those.
+  pr [title]   Commit any pending changes (title = commit message), push the
+               branch and open a PR against the trunk (gh pr create), then
+               open the PR page. With no title, your editor opens for the
+               commit message and gh fills the PR from commits.
+  kill [P …]   Stop the dev server, remove worktree(s), delete branch(es).
+               No args: current worktree. Port args: those, in parallel.
+  init         Set up this repo: write .dork.sh config, gitignore entries,
+               and the Claude Code worktree-guard hook. Commit the results so
+               teammates get them for free.
+  flow         Print the daily-flow cheat sheet (worktree → PR → merge → sync).
+  update       Update dork itself (git pull in $DORK_HOME).
+  version      Print the dork version.
+
+Project config lives in .dork.sh at the repo root (see '$PROG init').
+EOF
+  exit 1
+}
+
+# --- Repo + config resolution -----------------------------------------------
+
+REPO_ROOT=""
+WORKTREE_DIR=""
+BASE_PORT=""
+MAX_PORT=""
+MAIN_BRANCH=""
+
+# Resolve the MAIN checkout's root from wherever we're invoked — including
+# from inside a linked worktree, where .git is a file and --git-common-dir
+# points back at the main checkout's .git directory.
+resolve_repo_root() {
+  local common
+  common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  if [[ "$(basename "$common")" == ".git" ]]; then
+    dirname "$common"
+  else
+    # Bare or unusual layout — no working tree to anchor worktrees to.
+    return 1
+  fi
+}
+
+require_repo() {
+  [[ -n "$REPO_ROOT" ]] && return 0
+  REPO_ROOT="$(resolve_repo_root)" || return 1
+
+  # Project config — committed, shared by the whole team.
+  # shellcheck disable=SC1091
+  if [[ -f "$REPO_ROOT/.dork.sh" ]]; then
+    source "$REPO_ROOT/.dork.sh"
+  fi
+
+  WORKTREE_DIR="${DORK_WORKTREE_DIR:-$REPO_ROOT/.claude/worktrees}"
+  BASE_PORT="${DORK_BASE_PORT:-3001}"
+  MAX_PORT="${DORK_MAX_PORT:-3008}"
+  MAIN_BRANCH="$(resolve_main_branch)"
+  return 0
+}
+
+repo_required() {
+  require_repo || {
+    echo >&2 "[dork] Not inside a git repository (with a working tree)."
+    exit 1
+  }
+}
+
+resolve_main_branch() {
+  local b
+  b="$(git -C "$REPO_ROOT" config --get dork.main-branch 2>/dev/null || true)"
+  [[ -z "$b" ]] && b="${DORK_MAIN_BRANCH:-}"
+  if [[ -z "$b" ]]; then
+    b="$(git -C "$REPO_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    b="${b#origin/}"
+  fi
+  if [[ -z "$b" ]]; then
+    if git -C "$REPO_ROOT" show-ref --verify --quiet refs/heads/main; then
+      b="main"
+    elif git -C "$REPO_ROOT" show-ref --verify --quiet refs/heads/master; then
+      b="master"
+    else
+      b="main"
+    fi
+  fi
+  echo "$b"
+}
+
+# Branch prefix for new worktree branches (<prefix>/<port>). Zero-setup:
+# per-repo or global `git config dork.branch-prefix`, else DORK_BRANCH_PREFIX
+# from .dork.sh, else your login name.
+resolve_branch_prefix() {
+  local p
+  p="$(git -C "$REPO_ROOT" config --get dork.branch-prefix 2>/dev/null || true)"
+  [[ -z "$p" ]] && p="${DORK_BRANCH_PREFIX:-}"
+  [[ -z "$p" ]] && p="$(id -un 2>/dev/null || echo dev)"
+  p="${p%/}"
+  # keep it a valid ref component
+  p="$(echo "$p" | tr -c 'A-Za-z0-9._/-' '-' | sed 's/-*$//')"
+  [[ -z "$p" ]] && p="dev"
+  echo "$p"
+}
+
+# --- Project-command detection ----------------------------------------------
+
+# Dependency install command for a fresh worktree, echoed (empty = skip).
+resolve_install_cmd() {
+  if declare -F dork_install_deps >/dev/null; then
+    echo "__fn__"
+    return
+  fi
+  if [[ -n "${DORK_INSTALL_CMD:-}" ]]; then
+    echo "$DORK_INSTALL_CMD"
+    return
+  fi
+  if   [[ -f "$REPO_ROOT/pnpm-lock.yaml" ]];     then echo "pnpm install --frozen-lockfile"
+  elif [[ -f "$REPO_ROOT/yarn.lock" ]];          then echo "yarn install --frozen-lockfile"
+  elif [[ -f "$REPO_ROOT/package-lock.json" ]];  then echo "npm ci"
+  elif [[ -f "$REPO_ROOT/bun.lockb" || -f "$REPO_ROOT/bun.lock" ]]; then echo "bun install"
+  elif [[ -f "$REPO_ROOT/uv.lock" ]];            then echo "uv sync"
+  elif [[ -f "$REPO_ROOT/poetry.lock" ]];        then echo "poetry install"
+  elif [[ -f "$REPO_ROOT/Gemfile.lock" ]];       then echo "bundle install"
+  else echo ""
+  fi
+}
+
+run_install_deps() {
+  local wt_path="$1" cmd
+  cmd="$(resolve_install_cmd)"
+  if [[ "$cmd" == "__fn__" ]]; then
+    echo >&2 "[dork] Installing dependencies (dork_install_deps)"
+    (cd "$wt_path" && dork_install_deps "$wt_path") >&2
+  elif [[ -n "$cmd" ]]; then
+    echo >&2 "[dork] Installing dependencies: $cmd"
+    (cd "$wt_path" && eval "$cmd") >&2
+  fi
+}
+
+# The command the dev pane runs, echoed (empty = no dev server; the pane
+# becomes a plain shell in the worktree). '{port}' in DORK_DEV_CMD is
+# replaced with the worktree's port.
+dev_command_for() {
+  local port="$1"
+  if declare -F dork_dev_command >/dev/null; then
+    dork_dev_command "$port"
+    return
+  fi
+  if [[ -n "${DORK_DEV_CMD:-}" ]]; then
+    echo "${DORK_DEV_CMD//\{port\}/$port}"
+    return
+  fi
+  if [[ -f "$REPO_ROOT/package.json" ]] && grep -q '"dev"[[:space:]]*:' "$REPO_ROOT/package.json"; then
+    local pm="npm"
+    [[ -f "$REPO_ROOT/pnpm-lock.yaml" ]] && pm="pnpm"
+    [[ -f "$REPO_ROOT/yarn.lock" ]] && pm="yarn"
+    [[ -f "$REPO_ROOT/bun.lockb" || -f "$REPO_ROOT/bun.lock" ]] && pm="bun"
+    echo "PORT=$port $pm run dev"
+    return
+  fi
+  echo ""
+}
+
+# Copy env files into a fresh worktree. Projects that need per-worktree
+# rewrites (e.g. an APP_URL that must point at the worktree's port) override
+# this with a dork_setup_env function in .dork.sh.
+setup_env_files() {
+  local wt_path="$1" port="$2"
+  if declare -F dork_setup_env >/dev/null; then
+    dork_setup_env "$wt_path" "$port"
+    return
+  fi
+  local f
+  for f in ${DORK_ENV_FILES:-.env .env.local}; do
+    [[ -f "$REPO_ROOT/$f" ]] && cp "$REPO_ROOT/$f" "$wt_path/$f"
+  done
+  return 0
+}
+
+# The agent launched in each worktree pane. Override via .dork.sh.
+agent_command() {
+  local yolo="${1:-}"
+  if [[ -n "$yolo" ]]; then
+    echo "${DORK_YOLO_CMD:-claude --dangerously-skip-permissions}"
+  else
+    echo "${DORK_AGENT_CMD:-claude}"
+  fi
+}
+
+exec_agent() {
+  local wt_path="$1" yolo="${2:-}" cmd
+  cmd="$(agent_command "$yolo")"
+  cd "$wt_path"
+  local first="${cmd%% *}"
+  if ! command -v "$first" >/dev/null 2>&1; then
+    echo >&2 "[dork] '$first' not found — dropping into a shell in $wt_path"
+    exec "${SHELL:-bash}"
+  fi
+  exec bash -c "$cmd"
+}
+
+# --- Ports + worktree bookkeeping -------------------------------------------
+
+infer_worktree_name() {
+  local cwd
+  cwd="$(pwd)"
+  if [[ "$cwd" == "$WORKTREE_DIR/"* ]]; then
+    echo "$cwd" | sed "s|$WORKTREE_DIR/||" | cut -d'/' -f1
+  else
+    echo ""
+  fi
+}
+
+get_port() {
+  local port_file="$1/.worktree-port"
+  [[ -f "$port_file" ]] && cat "$port_file" || echo ""
+}
+
+is_port_in_use() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -i :"$1" -sTCP:LISTEN &>/dev/null
+}
+
+kill_port() {
+  local port="$1"
+  command -v lsof >/dev/null 2>&1 || return 0
+  if is_port_in_use "$port"; then
+    echo "[dork] Stopping dev server on port $port"
+    lsof -ti :"$port" -sTCP:LISTEN | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
+}
+
+find_free_port() {
+  local port
+  for port in $(seq "$BASE_PORT" "$MAX_PORT"); do
+    if [[ ! -d "$WORKTREE_DIR/$port" ]] && ! is_port_in_use "$port"; then
+      echo "$port"
+      return
+    fi
+  done
+  echo ""
+}
+
+# Echo the first N currently-free ports (no worktree dir, nothing listening),
+# one per line. Returns non-zero if fewer than N are available.
+find_free_ports() {
+  local count="$1" port
+  local -a ports=()
+  for port in $(seq "$BASE_PORT" "$MAX_PORT"); do
+    if [[ ! -d "$WORKTREE_DIR/$port" ]] && ! is_port_in_use "$port"; then
+      ports+=("$port")
+      [[ ${#ports[@]} -ge $count ]] && break
+    fi
+  done
+  [[ ${#ports[@]} -lt $count ]] && return 1
+  printf '%s\n' "${ports[@]}"
+}
+
+remove_one_worktree() {
+  local name="${1:?Missing worktree id}"
+  local wt_path="$WORKTREE_DIR/$name"
+
+  if [[ ! -d "$wt_path" ]]; then
+    echo "[dork] Worktree '$name' not found."
+    return 1
+  fi
+
+  local port
+  port="$(get_port "$wt_path")"
+  [[ -n "$port" ]] && kill_port "$port"
+
+  local branch
+  branch="$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+
+  echo "[dork] Removing worktree $name"
+  git -C "$REPO_ROOT" worktree remove "$wt_path" --force 2>/dev/null || rm -rf "$wt_path"
+
+  if [[ -n "$branch" && "$branch" != "HEAD" && "$branch" != "$MAIN_BRANCH" ]]; then
+    if git -C "$REPO_ROOT" rev-parse --verify "$branch" &>/dev/null; then
+      git -C "$REPO_ROOT" branch -D "$branch" 2>/dev/null && echo "  Deleted branch '$branch'" || true
+    fi
+  fi
+
+  echo "[dork] Worktree $name removed"
+}
+
+# Create one worktree: branch, env, deps. Echoes the worktree path on stdout;
+# all human-readable output goes to stderr so callers can capture the path
+# cleanly. Optional first arg: a specific port (skips auto-assignment).
+create_worktree() {
+  local port="${1:-}"
+
+  if [[ -z "$port" ]]; then
+    port="$(find_free_port)"
+    if [[ -z "$port" ]]; then
+      echo >&2 "[dork] No free port in range $BASE_PORT-$MAX_PORT (all in use or directories exist)."
+      return 1
+    fi
+  fi
+
+  local wt_path="$WORKTREE_DIR/$port"
+  mkdir -p "$(dirname "$wt_path")"
+
+  # Repo-local, shared by all worktrees: first `git push` on a new branch
+  # auto-creates origin/<branch> and sets tracking — no --set-upstream needed.
+  git -C "$REPO_ROOT" config push.autoSetupRemote true
+
+  local prefix branch_name
+  prefix="$(resolve_branch_prefix)"
+  branch_name="${prefix}/${port}"
+  echo >&2 "Creating worktree on port $port, branch $branch_name..."
+  git -C "$REPO_ROOT" worktree add "$wt_path" -b "$branch_name" "$MAIN_BRANCH" >&2
+
+  setup_env_files "$wt_path" "$port"
+  echo "$port" > "$wt_path/.worktree-port"
+  run_install_deps "$wt_path"
+
+  echo "$wt_path"
+}
+
+# --- Terminal backends -------------------------------------------------------
+
+# ghostty | tmux | none — override with DORK_TERMINAL in .dork.sh or the env.
+detect_terminal() {
+  case "${DORK_TERMINAL:-}" in
+    ghostty|tmux|none) echo "$DORK_TERMINAL"; return ;;
+  esac
+  if [[ -n "${TMUX:-}" ]]; then
+    echo "tmux"
+  elif [[ "$(uname)" == "Darwin" && "${TERM_PROGRAM:-}" == "ghostty" ]]; then
+    echo "ghostty"
+  else
+    echo "none"
+  fi
+}
+
+# - Ghostty (macOS, AppleScript) -
+
+# Capture the ID of the current (focused) Ghostty terminal before long-running
+# ops. Terminals don't expose a tty, but id is stable and unique across panes.
+ghostty_origin_term_id() {
+  osascript -e 'tell application "Ghostty" to get id of focused terminal of selected tab of front window as text' 2>/dev/null || echo ""
+}
+
+ghostty_select_term_script() {
+  local target_term_id="$1"
+  cat <<EOF
+      set currentTerm to missing value
+      if "$target_term_id" is not "" then
+        repeat with w in every window
+          repeat with t in every tab of w
+            repeat with term in every terminal of t
+              if (id of term as text) is "$target_term_id" then
+                set currentTerm to term
+              end if
+            end repeat
+          end repeat
+        end repeat
+      end if
+      if currentTerm is missing value then
+        set currentTerm to focused terminal of selected tab of front window
+      end if
+EOF
+}
+
+# Splits the given Ghostty term right (dev server) and that new pane down
+# (plain shell), so every worktree gets the same layout (agent | dev / shell).
+ghostty_split_dev_and_shell() {
+  local target_term_id="${1:?}" wt_path="${2:?}" dev_cmd="${3:-}"
+
+  local dev_input="cd $wt_path"
+  [[ -n "$dev_cmd" ]] && dev_input="cd $wt_path && $dev_cmd"
+
+  osascript -e "
+    tell application \"Ghostty\"
+$(ghostty_select_term_script "$target_term_id")
+      set devTerm to split currentTerm direction right
+      input text \"$dev_input\" & return to devTerm
+      delay 0.5
+      set plainTerm to split devTerm direction down
+      input text \"cd $wt_path\" & return to plainTerm
+    end tell
+  "
+}
+
+ghostty_tile() {
+  local yolo="$1" count="$2"
+  shift 2
+  local -a ports=("$@")
+
+  if [[ "$count" != "2" && "$count" != "4" ]]; then
+    echo >&2 "[dork] Ghostty tiling supports N=2 or N=4 (got: $count)"
+    exit 1
+  fi
+
+  local origin_term_id
+  origin_term_id="$(ghostty_origin_term_id)"
+
+  echo >&2 "[dork] Tiling Ghostty into $count panes (ports: ${ports[*]})"
+
+  # The new panes invoke `dork _init-port <port> <term_id> [yolo]`, which
+  # creates the worktree for that specific port, splits its own pane into
+  # dev+shell, and then execs the agent. Splitting before any creation means
+  # all N installs run concurrently across panes. Each spawned pane gets its
+  # own Ghostty term id because by the time _init-port runs, focus has likely
+  # moved to the last-created split.
+  local init="cd $REPO_ROOT && $DORK_BIN _init-port"
+  local init_suffix=""
+  [[ -n "$yolo" ]] && init_suffix=" yolo"
+
+  if [[ "$count" == "2" ]]; then
+    osascript -e "
+      tell application \"Ghostty\"
+$(ghostty_select_term_script "$origin_term_id")
+        set rightTerm to split currentTerm direction right
+        set rightId to id of rightTerm as text
+        delay 0.5
+        input text \"$init ${ports[1]} \" & rightId & \"$init_suffix\" & return to rightTerm
+      end tell
+    "
+  else
+    osascript -e "
+      tell application \"Ghostty\"
+$(ghostty_select_term_script "$origin_term_id")
+        set trTerm to split currentTerm direction right
+        set trId to id of trTerm as text
+        delay 0.5
+        set blTerm to split currentTerm direction down
+        set blId to id of blTerm as text
+        delay 0.5
+        set brTerm to split trTerm direction down
+        set brId to id of brTerm as text
+        delay 0.5
+        input text \"$init ${ports[1]} \" & trId & \"$init_suffix\" & return to trTerm
+        input text \"$init ${ports[2]} \" & blId & \"$init_suffix\" & return to blTerm
+        input text \"$init ${ports[3]} \" & brId & \"$init_suffix\" & return to brTerm
+      end tell
+    "
+  fi
+
+  # Origin pane runs its own creation + splits, then execs the agent —
+  # concurrently with the spawned panes above.
+  local wt_path
+  wt_path="$(create_worktree "${ports[0]}")" || exit 1
+  echo >&2 "[dork] Splitting Ghostty"
+  ghostty_split_dev_and_shell "$origin_term_id" "$wt_path" "$(dev_command_for "${ports[0]}")"
+  exec_agent "$wt_path" "$yolo"
+}
+
+# - tmux -
+
+tmux_split_dev_and_shell() {
+  local wt_path="${1:?}" dev_cmd="${2:-}"
+  local orig dev
+  orig="$(tmux display-message -p '#{pane_id}')"
+  dev="$(tmux split-window -h -c "$wt_path" -P -F '#{pane_id}')"
+  [[ -n "$dev_cmd" ]] && tmux send-keys -t "$dev" "$dev_cmd" Enter
+  tmux split-window -v -t "$dev" -c "$wt_path" >/dev/null
+  tmux select-pane -t "$orig"
+}
+
+tmux_tile() {
+  local yolo="$1" count="$2"
+  shift 2
+  local -a ports=("$@")
+
+  if (( count < 2 || count > 8 )); then
+    echo >&2 "[dork] tmux tiling supports N=2..8 (got: $count)"
+    exit 1
+  fi
+
+  echo >&2 "[dork] Tiling tmux into $count panes (ports: ${ports[*]})"
+
+  local orig i pane
+  orig="$(tmux display-message -p '#{pane_id}')"
+  local init_suffix=""
+  [[ -n "$yolo" ]] && init_suffix=" yolo"
+
+  for (( i=1; i<count; i++ )); do
+    pane="$(tmux split-window -t "$orig" -c "$REPO_ROOT" -P -F '#{pane_id}')"
+    tmux send-keys -t "$pane" "$DORK_BIN _init-port ${ports[$i]} ''$init_suffix" Enter
+    tmux select-layout -t "$orig" tiled >/dev/null
+  done
+  tmux select-pane -t "$orig"
+
+  local wt_path
+  wt_path="$(create_worktree "${ports[0]}")" || exit 1
+  tmux_split_dev_and_shell "$wt_path" "$(dev_command_for "${ports[0]}")"
+  exec_agent "$wt_path" "$yolo"
+}
+
+# --- new / yolo / tile -------------------------------------------------------
+
+cmd_new() {
+  local yolo=""
+  [[ "${1:-}" == yolo ]] && yolo="yolo"
+
+  local terminal
+  terminal="$(detect_terminal)"
+
+  local origin_term_id=""
+  [[ "$terminal" == "ghostty" ]] && origin_term_id="$(ghostty_origin_term_id)"
+
+  local wt_path port
+  wt_path="$(create_worktree)" || exit 1
+  port="$(get_port "$wt_path")"
+  local dev_cmd
+  dev_cmd="$(dev_command_for "$port")"
+
+  case "$terminal" in
+    ghostty)
+      echo >&2 "[dork] Splitting Ghostty"
+      ghostty_split_dev_and_shell "$origin_term_id" "$wt_path" "$dev_cmd"
+      ;;
+    tmux)
+      echo >&2 "[dork] Splitting tmux"
+      tmux_split_dev_and_shell "$wt_path" "$dev_cmd"
+      ;;
+    none)
+      echo >&2 "[dork] Worktree ready: $wt_path"
+      [[ -n "$dev_cmd" ]] && echo >&2 "[dork] Dev server: (cd $wt_path && $dev_cmd)"
+      ;;
+  esac
+
+  exec_agent "$wt_path" "$yolo"
+}
+
+# Multi-pane mode for `new N` / `yolo N`: reserve N ports, tile the terminal,
+# and run one worktree + agent per pane. First arg is optionally `yolo`.
+cmd_tile() {
+  local yolo=""
+  if [[ "${1:-}" == yolo ]]; then
+    yolo="yolo"
+    shift
+  fi
+  local count="${1:?[dork] tile requires a pane count}"
+
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    echo >&2 "[dork] Pane count must be a number (got: $count)"
+    exit 1
+  fi
+
+  local terminal
+  terminal="$(detect_terminal)"
+  if [[ "$terminal" == "none" ]]; then
+    echo >&2 "[dork] '$PROG new $count' needs Ghostty (macOS) or tmux for pane tiling."
+    echo >&2 "[dork] Run '$PROG new' per terminal instead, or start a tmux session first."
+    exit 1
+  fi
+
+  # Reserve N ports up front so we can split the panes immediately and let
+  # each pane do its own create_worktree + install in parallel.
+  local -a ports=()
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && ports+=("$p")
+  done < <(find_free_ports "$count")
+  if [[ ${#ports[@]} -lt $count ]]; then
+    echo >&2 "[dork] Could not find $count free ports in range $BASE_PORT-$MAX_PORT"
+    exit 1
+  fi
+
+  case "$terminal" in
+    ghostty) ghostty_tile "$yolo" "$count" "${ports[@]}" ;;
+    tmux)    tmux_tile "$yolo" "$count" "${ports[@]}" ;;
+  esac
+}
+
+# Internal: invoked by spawned panes during `new N`/`yolo N`. Creates the
+# worktree for a specific pre-assigned port, splits this pane into dev+shell
+# to match the single-pane layout, then execs the agent. Second arg: Ghostty
+# term id of this pane (captured at split time; unused under tmux). Optional
+# third arg `yolo`. Not in usage.
+cmd_init_port() {
+  local port="${1:?[dork] _init-port requires a port}"
+  local target_term_id="${2:-}"
+  local yolo=""
+  [[ "${3:-}" == yolo ]] && yolo="yolo"
+
+  local terminal
+  terminal="$(detect_terminal)"
+  if [[ "$terminal" == "ghostty" && -z "$target_term_id" ]]; then
+    target_term_id="$(ghostty_origin_term_id)"
+  fi
+
+  local wt_path
+  wt_path="$(create_worktree "$port")" || exit 1
+  local dev_cmd
+  dev_cmd="$(dev_command_for "$port")"
+
+  case "$terminal" in
+    ghostty) ghostty_split_dev_and_shell "$target_term_id" "$wt_path" "$dev_cmd" ;;
+    tmux)    tmux_split_dev_and_shell "$wt_path" "$dev_cmd" ;;
+    none)    [[ -n "$dev_cmd" ]] && echo >&2 "[dork] Dev server: (cd $wt_path && $dev_cmd)" ;;
+  esac
+  exec_agent "$wt_path" "$yolo"
+}
+
+# --- sync --------------------------------------------------------------------
+
+# Delete refs/remotes/origin/<branch> once origin no longer has the branch —
+# i.e. the PR was merged with "Delete branch". That deletion happens
+# server-side, so nothing prunes our local remote-tracking ref: it lingers,
+# still pointing at the pre-merge tip. `push --force-with-lease` (no explicit
+# expectation) leases against exactly that ref, so it would demand the remote
+# still be at the pre-merge tip while the remote has no ref at all — rejected
+# as "(stale info)", on a push that is really just re-creating the branch.
+# Dropping the ref makes the lease correctly expect "no ref", and
+# push.autoSetupRemote re-creates the branch and its tracking.
+drop_stale_remote_ref() {
+  local wt_path="${1:?}" branch="${2:?}"
+  git -C "$wt_path" update-ref -d "refs/remotes/origin/$branch" 2>/dev/null || true
+}
+
+# Keep origin/<branch> alive between PRs. After the local branch has been
+# fast-forwarded or reset to the trunk, a remote branch that survived the
+# merge still points at the pre-merge tip, which breaks plain `git pull` /
+# `git push` in that worktree. Realign it to the local tip when — and only
+# when — everything it has is already in the trunk: its tip is an ancestor of
+# the trunk (rebase/ff merge) or gh knows it as a merged PR head (squash
+# merge). Anything else might be unintegrated work — hands off, warn instead.
+# Also restores upstream tracking, and drops it when the remote branch is
+# gone (the --delete-branch flow; the next push re-creates origin/<branch>
+# via push.autoSetupRemote).
+realign_remote_branch() {
+  local wt_path="${1:?}" branch="${2:?}" name="${3:?}"
+
+  if ! git -C "$wt_path" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+    git -C "$wt_path" branch --unset-upstream 2>/dev/null || true
+    drop_stale_remote_ref "$wt_path" "$branch"
+    return 0
+  fi
+
+  git -C "$wt_path" fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || true
+
+  local local_tip remote_tip
+  local_tip="$(git -C "$wt_path" rev-parse "$branch")"
+  remote_tip="$(git -C "$wt_path" rev-parse "refs/remotes/origin/$branch" 2>/dev/null || echo "")"
+
+  if [[ -n "$remote_tip" && "$remote_tip" != "$local_tip" ]]; then
+    local safe=""
+    if git -C "$wt_path" merge-base --is-ancestor "$remote_tip" "$MAIN_BRANCH" 2>/dev/null; then
+      safe=1
+    elif command -v gh >/dev/null 2>&1; then
+      local merged_tips
+      merged_tips="$(cd "$wt_path" && gh pr list --head "$branch" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null || true)"
+      if [[ -n "$merged_tips" ]] && grep -qx "$remote_tip" <<<"$merged_tips"; then
+        safe=1
+      fi
+    fi
+    if [[ -z "$safe" ]]; then
+      echo >&2 "[dork:$name] origin/$branch has commits $MAIN_BRANCH doesn't contain — integrate them in $wt_path (e.g. 'git pull --rebase'), then re-run sync."
+      return 1
+    fi
+    echo "[dork:$name] Realigning origin/$branch to the new tip (--force-with-lease)"
+    if ! git -C "$wt_path" push --force-with-lease origin "$branch"; then
+      echo >&2 "[dork:$name] Push refused — origin/$branch moved since the last fetch; reconcile in $wt_path, then re-run sync."
+      return 1
+    fi
+  fi
+
+  # Restore tracking so plain `git pull` / `git push` work between syncs.
+  if ! git -C "$wt_path" config --get "branch.$branch.merge" >/dev/null 2>&1; then
+    git -C "$wt_path" branch --set-upstream-to="origin/$branch" "$branch" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Bring one worktree's branch up to date with the (already-pulled) local
+# trunk. Linear-history flavor: everything rebases onto the trunk; a pushed
+# branch is then pushed with --force-with-lease so origin/<branch> (and its
+# PR) follows the rewrite. Returns non-zero when the user has to step in
+# (conflicts, diverged remote); each message says which worktree and what to
+# do.
+sync_one_worktree() {
+  local wt_path="${1:?}"
+  local name
+  name="$(basename "$wt_path")"
+
+  if [[ ! -d "$wt_path" ]]; then
+    echo >&2 "[dork:$name] Worktree not found."
+    return 1
+  fi
+
+  local branch
+  branch="$(git -C "$wt_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
+  if [[ "$branch" == "HEAD" || "$branch" == "$MAIN_BRANCH" ]]; then
+    echo >&2 "[dork:$name] Not on a work branch (on '$branch') — skipping."
+    return 1
+  fi
+
+  # Nothing here that the trunk doesn't already have → just fast-forward,
+  # then bring a stale origin/<branch> back in step.
+  if [[ "$(git -C "$wt_path" rev-list --count "$MAIN_BRANCH..$branch")" -eq 0 ]]; then
+    echo "[dork:$name] Fast-forwarding '$branch' to $MAIN_BRANCH"
+    if ! git -C "$wt_path" merge --ff-only --autostash "$MAIN_BRANCH"; then
+      echo >&2 "[dork:$name] Fast-forward failed — see message above."
+      return 1
+    fi
+    realign_remote_branch "$wt_path" "$branch" "$name"
+    return $?
+  fi
+
+  # Never pushed → rebasing is free (there is no remote to disagree with).
+  if ! git -C "$wt_path" config --get "branch.$branch.merge" >/dev/null 2>&1; then
+    echo "[dork:$name] Rebasing unpushed '$branch' onto $MAIN_BRANCH"
+    if ! git -C "$wt_path" rebase --autostash "$MAIN_BRANCH"; then
+      echo >&2 "[dork:$name] Rebase conflicts — resolve in $wt_path, then 'git rebase --continue' (or --abort) and re-run sync."
+      return 1
+    fi
+    return 0
+  fi
+
+  # Pushed. If gh confirms our exact tip was squash-merged, the work is in
+  # the trunk — restart the branch from it, then bring origin/<branch> along:
+  # a surviving remote branch is realigned to the new tip (so it stays alive
+  # between PRs), a deleted one is simply re-created by the next push. Any
+  # check that fails falls through to the merge path below, which is never
+  # destructive.
+  local head merged_tips=""
+  head="$(git -C "$wt_path" rev-parse HEAD)"
+  if command -v gh >/dev/null 2>&1; then
+    merged_tips="$(cd "$wt_path" && gh pr list --head "$branch" --state merged --json headRefOid --jq '.[].headRefOid' 2>/dev/null || true)"
+  fi
+  if [[ -n "$merged_tips" ]] && grep -qx "$head" <<<"$merged_tips"; then
+    local stashed=""
+    if [[ -n "$(git -C "$wt_path" status --porcelain)" ]]; then
+      echo "[dork:$name] Stashing local changes to carry them across the restart"
+      git -C "$wt_path" stash push --include-untracked -m "dork sync: WIP carried over branch restart" >/dev/null || return 1
+      stashed=1
+    fi
+    echo "[dork:$name] PR merged — restarting '$branch' from fresh $MAIN_BRANCH"
+    git -C "$wt_path" reset --hard "$MAIN_BRANCH" >/dev/null || return 1
+    if [[ -n "$stashed" ]]; then
+      if ! git -C "$wt_path" stash pop; then
+        echo >&2 "[dork:$name] Stash pop conflicts — resolve in $wt_path (your WIP is safe in 'git stash list')."
+        return 1
+      fi
+    fi
+    realign_remote_branch "$wt_path" "$branch" "$name"
+    return $?
+  fi
+
+  # Pushed with an open PR (or merged-ness unconfirmed): rebase onto the
+  # trunk, then keep origin/<branch> in step with --force-with-lease. Before
+  # rewriting anything, refresh our view of the remote branch and bail if it
+  # grew commits we don't have (e.g. a suggestion applied on GitHub) — the
+  # lease would refuse the push anyway, but failing early beats rebasing
+  # first. If the remote branch is gone (deleted after a merge gh couldn't
+  # confirm, or offline), rebase locally and skip the push.
+  local remote_has_branch=""
+  if git -C "$wt_path" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+    remote_has_branch=1
+    git -C "$wt_path" fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || true
+    if [[ "$(git -C "$wt_path" rev-list --count "$branch..origin/$branch" 2>/dev/null || echo 0)" -gt 0 ]]; then
+      echo >&2 "[dork:$name] origin/$branch has commits not in the local branch — integrate them in $wt_path (e.g. 'git pull --rebase'), then re-run sync."
+      return 1
+    fi
+  fi
+
+  echo "[dork:$name] Rebasing '$branch' onto $MAIN_BRANCH"
+  if ! git -C "$wt_path" rebase --autostash "$MAIN_BRANCH"; then
+    echo >&2 "[dork:$name] Rebase conflicts — resolve in $wt_path, then 'git rebase --continue' (or --abort) and re-run sync."
+    return 1
+  fi
+
+  if [[ -n "$remote_has_branch" ]]; then
+    echo "[dork:$name] Pushing rebased '$branch' (--force-with-lease)"
+    if ! git -C "$wt_path" push --force-with-lease origin "$branch"; then
+      echo >&2 "[dork:$name] Push refused — origin/$branch moved since the last fetch; reconcile in $wt_path, then re-run sync."
+      return 1
+    fi
+  fi
+}
+
+cmd_sync() {
+  local -a targets=()
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "all" ]]; then
+      local d
+      for d in "$WORKTREE_DIR"/*/; do
+        [[ -d "$d" ]] && targets+=("${d%/}")
+      done
+      if [[ ${#targets[@]} -eq 0 ]]; then
+        echo >&2 "[dork] No worktrees under $WORKTREE_DIR"
+        exit 1
+      fi
+    else
+      local arg
+      for arg in "$@"; do
+        targets+=("$WORKTREE_DIR/$arg")
+      done
+    fi
+  else
+    local name
+    name="$(infer_worktree_name)"
+    if [[ -z "$name" ]]; then
+      echo >&2 "[dork] Run from inside a worktree, or use '$PROG sync all' / '$PROG sync <port> …'"
+      exit 1
+    fi
+    targets=("$WORKTREE_DIR/$name")
+  fi
+
+  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+    echo "[dork] Updating trunk"
+    (cd "$REPO_ROOT" && git pull --ff-only origin "$MAIN_BRANCH")
+  else
+    echo "[dork] No 'origin' remote — skipping trunk pull"
+  fi
+
+  # Sequential on purpose: conflict output must stay readable, and a conflict
+  # in one worktree never blocks the others — we keep going and summarize.
+  local rc=0 t
+  for t in "${targets[@]}"; do
+    sync_one_worktree "$t" || rc=1
+  done
+
+  if [[ $rc -eq 0 ]]; then
+    echo "[dork] Sync complete"
+  else
+    echo >&2 "[dork] Sync finished with issues — see the [dork:<port>] messages above."
+  fi
+  exit "$rc"
+}
+
+# --- pr ----------------------------------------------------------------------
+
+# Open a URL in the default browser; silently a no-op where no opener exists.
+open_url() {
+  local url="$1"
+  [[ -n "$url" ]] || return 0
+  if command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1 || true
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 || true
+  fi
+}
+
+# Push the current branch and open a PR against the trunk. Uncommitted work
+# never blocks it: pending changes are committed first, with the PR title as
+# the commit message when one was given. Reuses the open PR if one already
+# exists (the push has updated it). --force-with-lease makes the push safe
+# right after a sync rebase, and is an ordinary create for a never-pushed
+# branch (autoSetupRemote sets tracking).
+cmd_pr() {
+  local title="${1:-}"
+
+  if ! command -v gh >/dev/null 2>&1; then
+    echo >&2 "[dork] '$PROG pr' needs the GitHub CLI (gh) — https://cli.github.com"
+    exit 1
+  fi
+
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+  if [[ -z "$branch" || "$branch" == "HEAD" || "$branch" == "$MAIN_BRANCH" ]]; then
+    echo >&2 "[dork] Run from a work branch (currently on '${branch:-no git repo}')."
+    exit 1
+  fi
+
+  if [[ -n "$(git status --porcelain)" ]]; then
+    git add -A
+    if [[ -n "$title" ]]; then
+      echo "[dork] Committing pending changes: $title"
+      git commit -m "$title"
+    else
+      # No title given — open your editor with an empty message. Write it
+      # yourself; it also becomes gh's --fill PR title. Abort the commit
+      # (empty message / quit without saving) and no PR is opened.
+      echo "[dork] Opening editor for the commit message"
+      if ! git commit; then
+        echo >&2 "[dork] Commit aborted — no PR opened."
+        exit 1
+      fi
+    fi
+  fi
+
+  if [[ "$(git rev-list --count "$MAIN_BRANCH..$branch")" -eq 0 ]]; then
+    echo >&2 "[dork] '$branch' has no commits that $MAIN_BRANCH lacks — nothing to open a PR for."
+    exit 1
+  fi
+
+  # The previous PR may have been merged with "Delete branch", which leaves a
+  # stale remote-tracking ref behind (see drop_stale_remote_ref). sync clears
+  # it, but pr has to stand alone: the next task on a branch often goes
+  # straight to a PR with no sync in between.
+  if ! git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+    git branch --unset-upstream 2>/dev/null || true
+    drop_stale_remote_ref "." "$branch"
+  fi
+
+  echo "[dork] Pushing '$branch'"
+  if ! git push --force-with-lease; then
+    echo >&2 "[dork] Push refused — origin/$branch has commits you don't have; fetch + reconcile, then re-run."
+    exit 1
+  fi
+
+  local existing
+  existing="$(gh pr list --head "$branch" --state open --json url --jq '.[].url' 2>/dev/null || true)"
+  if [[ -n "$existing" ]]; then
+    echo "[dork] Open PR already exists (push updated it): $existing"
+    open_url "$existing"
+    return 0
+  fi
+
+  # No open PR to update. If this branch's previous PR already merged, say so
+  # — a merged PR can't take new commits, so a fresh PR is the only option
+  # and shouldn't look like a bug.
+  local last_merged
+  last_merged="$(gh pr list --head "$branch" --state merged --limit 1 --json number --jq '.[].number' 2>/dev/null || true)"
+  if [[ -n "$last_merged" ]]; then
+    echo "[dork] Previous PR #$last_merged from '$branch' is already merged — opening a new PR."
+  fi
+
+  local url
+  if [[ -n "$title" ]]; then
+    url="$(gh pr create --base "$MAIN_BRANCH" --title "$title" --body "")"
+  else
+    url="$(gh pr create --base "$MAIN_BRANCH" --fill)"
+  fi
+  echo "$url"
+  open_url "$url"
+}
+
+# --- kill --------------------------------------------------------------------
+
+cmd_kill() {
+  # Multi-target mode: any args are treated as worktree ids/ports and removed
+  # in parallel. Output from concurrent removals will interleave; each line
+  # is prefixed with its worktree name so it's still readable.
+  if [[ $# -gt 0 ]]; then
+    local -a pids=()
+    local arg
+    for arg in "$@"; do
+      remove_one_worktree "$arg" &
+      pids+=($!)
+    done
+    local pid rc=0
+    for pid in "${pids[@]}"; do
+      wait "$pid" || rc=$?
+    done
+    exit "$rc"
+  fi
+
+  local name
+  name="$(infer_worktree_name)"
+  if [[ -z "$name" ]]; then
+    echo >&2 "[dork] Run this from inside a worktree under $WORKTREE_DIR/<port>/, or pass one or more ports as args"
+    exit 1
+  fi
+
+  remove_one_worktree "$name"
+}
+
+# --- flow --------------------------------------------------------------------
+
+cmd_flow() {
+  cat <<EOF
+dork daily flow — plain git + gh, linear history (sync rebases; no merge commits).
+A pushed branch follows its rebase with push --force-with-lease; the lease
+refuses to clobber remote commits you haven't fetched. Merged PR → branch is
+reset to the fresh trunk and a surviving origin/<branch> is realigned to it,
+so the branch stays alive between PRs (a --delete-branch merge works too; the
+next push re-creates it).
+
+  1. Start of day    $PROG yolo 4             4 worktrees, ports $BASE_PORT-$MAX_PORT
+  2. Develop         edit + test on http://localhost:<port>, commit as you go
+  3. Open a PR       $PROG pr "Fix the thing" (commits pending changes, then
+                                              push + gh pr create; no title:
+                                              editor opens for the message)
+  4. Review & merge  review on GitHub, then:
+                     gh pr merge --squash    (--delete-branch also works)
+  5. Sync everyone   $PROG sync all           (or $PROG sync in a worktree, or $PROG sync 3001 3004)
+                       nothing the trunk lacks     → fast-forward
+                       PR merged (gh confirms tip) → reset to fresh trunk
+                     (both realign a surviving stale origin/<branch>)
+                       otherwise                   → rebase onto trunk; pushed branch
+                                                     also pushed --force-with-lease
+                     conflicts: fix in that worktree, git rebase --continue, re-run sync
+  6. Keep going      next task on the same branch: commit → $PROG pr "…"
+  7. Tear down       $PROG kill               (or $PROG kill 3001 3002 …)
+EOF
+}
+
+# --- init --------------------------------------------------------------------
+
+# Set up the current repo for dork. Everything init writes is meant to be
+# COMMITTED, so teammates who install dork need zero per-repo setup.
+cmd_init() {
+  local wrote=""
+
+  # 1. Project config
+  if [[ -f "$REPO_ROOT/.dork.sh" ]]; then
+    echo "[dork] .dork.sh already exists — leaving it alone"
+  else
+    cat > "$REPO_ROOT/.dork.sh" <<'EOF'
+# dork project config — commit this file. https://github.com/pipedreamerai/dork
+# Everything is optional; sensible defaults are auto-detected. Uncomment to override.
+
+# Port range for worktrees (also used as worktree/branch ids). Give each of
+# your projects a distinct range so parallel worktrees never collide.
+#DORK_BASE_PORT=3001
+#DORK_MAX_PORT=3008
+
+# Dev-server command for the dev pane; {port} is replaced per worktree.
+# Default: auto-detected "PORT={port} <npm|pnpm|yarn|bun> run dev" when
+# package.json has a dev script. Set to a command, or define a function.
+#DORK_DEV_CMD='PORT={port} pnpm dev'
+#dork_dev_command() { echo "PORT=$1 pnpm dev"; }
+
+# Dependency install for a fresh worktree. Default: auto-detected from the
+# lockfile (pnpm/yarn/npm/bun/uv/poetry/bundler).
+#DORK_INSTALL_CMD='pnpm install --frozen-lockfile'
+
+# Env files copied from the repo root into each worktree.
+#DORK_ENV_FILES='.env .env.local'
+# For per-worktree rewrites, define a function instead (args: worktree path, port):
+#dork_setup_env() {
+#  cp "$REPO_ROOT/.env.local" "$1/.env.local"
+#  echo "APP_URL=http://localhost:$2" >> "$1/.env.local"
+#}
+
+# Agent launched in each worktree pane (default: claude).
+#DORK_AGENT_CMD='claude'
+#DORK_YOLO_CMD='claude --dangerously-skip-permissions'
+
+# Trunk branch (default: auto-detected), worktree location, terminal backend.
+#DORK_MAIN_BRANCH=main
+#DORK_WORKTREE_DIR="$REPO_ROOT/.claude/worktrees"
+#DORK_TERMINAL=tmux   # ghostty | tmux | none (default: auto-detect)
+EOF
+    echo "[dork] Wrote .dork.sh (edit to taste)"
+    wrote=1
+  fi
+
+  # 2. gitignore entries
+  local gi="$REPO_ROOT/.gitignore" added=""
+  touch "$gi"
+  local wt_rel=".claude/worktrees/"
+  if [[ -n "${DORK_WORKTREE_DIR:-}" ]]; then
+    wt_rel="${DORK_WORKTREE_DIR#"$REPO_ROOT"/}/"
+  fi
+  local line
+  for line in "$wt_rel" ".worktree-port"; do
+    if ! grep -qxF "$line" "$gi"; then
+      [[ -z "$added" ]] && printf '\n# dork worktrees\n' >> "$gi"
+      printf '%s\n' "$line" >> "$gi"
+      added=1
+    fi
+  done
+  [[ -n "$added" ]] && { echo "[dork] Added worktree entries to .gitignore"; wrote=1; }
+
+  # 3. Claude Code guard hook — blocks edits that leak out of the active
+  # worktree into the main checkout (wrong branch). Optional but recommended
+  # when the agent is Claude Code.
+  if [[ -f "$DORK_HOME/hooks/block-main-repo-edits.py" ]]; then
+    mkdir -p "$REPO_ROOT/.claude/hooks"
+    if ! cmp -s "$DORK_HOME/hooks/block-main-repo-edits.py" "$REPO_ROOT/.claude/hooks/block-main-repo-edits.py" 2>/dev/null; then
+      cp "$DORK_HOME/hooks/block-main-repo-edits.py" "$REPO_ROOT/.claude/hooks/block-main-repo-edits.py"
+      chmod +x "$REPO_ROOT/.claude/hooks/block-main-repo-edits.py"
+      echo "[dork] Installed .claude/hooks/block-main-repo-edits.py"
+      wrote=1
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+      if REPO_ROOT="$REPO_ROOT" python3 - <<'PYEOF'
+import json, os, sys
+
+path = os.path.join(os.environ["REPO_ROOT"], ".claude", "settings.json")
+entry = {
+    "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+    "hooks": [{
+        "type": "command",
+        "command": 'f="$CLAUDE_PROJECT_DIR/.claude/hooks/block-main-repo-edits.py"; if [ -f "$f" ]; then python3 "$f"; else exit 0; fi',
+        "statusMessage": "Checking edit stays in the worktree",
+    }],
+}
+settings = {}
+if os.path.exists(path):
+    with open(path) as f:
+        settings = json.load(f)
+pre = settings.setdefault("hooks", {}).setdefault("PreToolUse", [])
+if any("block-main-repo-edits" in json.dumps(e) for e in pre):
+    sys.exit(1)  # already wired
+pre.append(entry)
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+      then
+        echo "[dork] Wired the worktree guard into .claude/settings.json"
+        wrote=1
+      fi
+    else
+      echo "[dork] python3 not found — skipped wiring .claude/settings.json (the hook needs python3 anyway)"
+    fi
+  fi
+
+  echo
+  if [[ -n "$wrote" ]]; then
+    echo "[dork] Done. Review + commit: .dork.sh .gitignore .claude/"
+  else
+    echo "[dork] Already set up — nothing to do."
+  fi
+  echo "[dork] Optional: git config --global dork.branch-prefix <yourname>  (default: your login name)"
+}
+
+# --- update / version --------------------------------------------------------
+
+cmd_update() {
+  if [[ ! -d "$DORK_HOME/.git" ]]; then
+    echo >&2 "[dork] $DORK_HOME is not a git checkout — reinstall via install.sh"
+    exit 1
+  fi
+  echo "[dork] Updating $DORK_HOME"
+  git -C "$DORK_HOME" pull --ff-only
+}
+
+# --- Main --------------------------------------------------------------------
+
+[[ $# -ge 1 ]] || usage
+
+case "$1" in
+  new)         shift; repo_required
+               if [[ $# -ge 1 ]]; then cmd_tile "$@"; else cmd_new; fi ;;
+  yolo)        shift; repo_required
+               if [[ $# -ge 1 ]]; then cmd_tile yolo "$@"; else cmd_new yolo; fi ;;
+  _init-port)  shift; repo_required; cmd_init_port "$@" ;;
+  sync)        shift; repo_required; cmd_sync "$@" ;;
+  pr)          shift; repo_required; cmd_pr "$@" ;;
+  kill)        shift; repo_required; cmd_kill "$@" ;;
+  init)        shift; repo_required; cmd_init ;;
+  flow)        require_repo || { BASE_PORT=3001; MAX_PORT=3008; }; cmd_flow ;;
+  update)      cmd_update ;;
+  version|--version|-v) echo "dork $DORK_VERSION" ;;
+  help|--help|-h) usage ;;
+  *)           usage ;;
+esac
