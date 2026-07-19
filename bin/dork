@@ -1258,7 +1258,7 @@ cmd_update() {
     git -C "$DORK_HOME" pull --ff-only
   elif [[ "$DORK_HOME" == */node_modules/* ]]; then
     echo "[dork] npm install — updating via npm"
-    exec npm install -g '@pipedreamerai/dork@latest'
+    exec npm install -g '@withkord/dork@latest'
   else
     echo >&2 "[dork] $DORK_HOME is not a git checkout — reinstall via install.sh"
     exit 1

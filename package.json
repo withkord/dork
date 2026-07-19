@@ -1,5 +1,5 @@
 {
-  "name": "@pipedreamerai/dork",
+  "name": "@withkord/dork",
   "version": "0.2.0",
   "description": "Parallel git worktrees for agentic coding",
   "license": "MIT",

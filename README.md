@@ -22,7 +22,7 @@ Linear history, no merge commits, no branch babysitting.
 curl -fsSL https://raw.githubusercontent.com/pipedreamerai/dork/main/install.sh | bash
 ```
 
-Or via npm: `npm install -g @pipedreamerai/dork`. Or from a clone:
+Or via npm: `npm install -g @withkord/dork`. Or from a clone:
 `git clone https://github.com/pipedreamerai/dork && ./dork/install.sh`.
 Update any time with `dork update` (it detects how dork was installed).
 
