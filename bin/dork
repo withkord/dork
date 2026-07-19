@@ -14,7 +14,7 @@
 #   dork kill [P …] — kill worktree(s) + branch(es); no args: current worktree
 #   dork init       — set up the current repo for dork (config, gitignore, hook)
 #   dork flow       — print the daily-flow cheat sheet
-#   dork update     — update dork itself (git pull in its checkout)
+#   dork update     — update dork itself (git pull, or npm for npm installs)
 #
 # FLOW — plain git + gh, linear history everywhere: sync always REBASES onto
 # the trunk, so no "Merge branch …" commits. A branch that has been pushed
@@ -70,7 +70,7 @@ Usage: $PROG <command>
                (deny rules guard destructive git even in yolo mode); with
                neither flag, an interactive run asks.
   flow         Print the daily-flow cheat sheet (worktree → PR → merge → sync).
-  update       Update dork itself (git pull in $DORK_HOME).
+  update       Update dork itself (git pull, or npm for npm installs).
   version      Print the dork version.
 
 Project config lives in .dork.sh at the repo root (see '$PROG init').
@@ -1253,12 +1253,16 @@ PYEOF
 # --- update / version --------------------------------------------------------
 
 cmd_update() {
-  if [[ ! -d "$DORK_HOME/.git" ]]; then
+  if [[ -d "$DORK_HOME/.git" ]]; then
+    echo "[dork] Updating $DORK_HOME"
+    git -C "$DORK_HOME" pull --ff-only
+  elif [[ "$DORK_HOME" == */node_modules/* ]]; then
+    echo "[dork] npm install — updating via npm"
+    exec npm install -g '@pipedreamerai/dork@latest'
+  else
     echo >&2 "[dork] $DORK_HOME is not a git checkout — reinstall via install.sh"
     exit 1
   fi
-  echo "[dork] Updating $DORK_HOME"
-  git -C "$DORK_HOME" pull --ff-only
 }
 
 # --- Main --------------------------------------------------------------------

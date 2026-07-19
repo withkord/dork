@@ -1,0 +1,38 @@
+{
+  "name": "@pipedreamerai/dork",
+  "version": "0.2.0",
+  "description": "Parallel git worktrees for agentic coding",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipedreamerai/dork.git"
+  },
+  "homepage": "https://github.com/pipedreamerai/dork#readme",
+  "bugs": "https://github.com/pipedreamerai/dork/issues",
+  "keywords": [
+    "git",
+    "worktree",
+    "claude-code",
+    "coding-agent",
+    "tmux",
+    "ghostty"
+  ],
+  "bin": {
+    "dork": "bin/dork"
+  },
+  "files": [
+    "bin",
+    "claude",
+    "hooks"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepublishOnly": "grep -q \"^DORK_VERSION=\\\"$npm_package_version\\\"$\" bin/dork || { echo \"package.json version $npm_package_version != DORK_VERSION in bin/dork\" >&2; exit 1; }"
+  }
+}
