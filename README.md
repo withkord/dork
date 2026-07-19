@@ -19,11 +19,11 @@ Linear history, no merge commits, no branch babysitting.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pipedreamerai/dork/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/withkord/dork/main/install.sh | bash
 ```
 
 Or via npm: `npm install -g @withkord/dork`. Or from a clone:
-`git clone https://github.com/pipedreamerai/dork && ./dork/install.sh`.
+`git clone https://github.com/withkord/dork && ./dork/install.sh`.
 Update any time with `dork update` (it detects how dork was installed).
 
 **Requirements:** git ≥ 2.31 and bash. Optional but recommended: [`gh`](https://cli.github.com)

@@ -5,10 +5,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pipedreamerai/dork.git"
+    "url": "git+https://github.com/withkord/dork.git"
   },
-  "homepage": "https://github.com/pipedreamerai/dork#readme",
-  "bugs": "https://github.com/pipedreamerai/dork/issues",
+  "homepage": "https://github.com/withkord/dork#readme",
+  "bugs": "https://github.com/withkord/dork/issues",
   "keywords": [
     "git",
     "worktree",

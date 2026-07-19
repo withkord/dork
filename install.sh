@@ -2,7 +2,7 @@
 #
 # dork installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/pipedreamerai/dork/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/withkord/dork/main/install.sh | bash
 #
 # Clones (or updates) dork into $DORK_HOME (default ~/.dork) and writes a
 # `dork` launcher into a writable bin dir on your PATH. Running ./install.sh
@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-REPO_URL="${DORK_REPO_URL:-https://github.com/pipedreamerai/dork.git}"
+REPO_URL="${DORK_REPO_URL:-https://github.com/withkord/dork.git}"
 
 # Running from a checkout? Use it. Piped through bash? Clone.
 SCRIPT_DIR=""
