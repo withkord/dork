@@ -112,6 +112,7 @@ worktree: resolve there, `git rebase --continue`, re-run sync.
 | `dork pr [title]` | Commit pending changes, push, open a GitHub PR, open its page. |
 | `dork kill [P …]` | Stop dev server(s), remove worktree(s), delete branch(es). |
 | `dork init [--permissions]` | Set up the current repo (config, gitignore, Claude guard hook, optional permission set). |
+| `dork db squash` / `dork db repair …` | Supabase migration squash & repair for teams — see below. |
 | `dork flow` | Print the daily-flow cheat sheet. |
 | `dork update` | Update dork itself. |
 
@@ -158,6 +159,61 @@ DORK_DEV_CMD='PORT={port} pnpm dev'
 
 Per-user (not committed): `git config --global dork.branch-prefix yourname`,
 `git config dork.main-branch <branch>` (per repo, overrides detection).
+
+## Supabase migrations (`dork db`)
+
+For repos on Supabase, `dork db` gives the whole team a safe squash/repair
+loop for `supabase/migrations/`. **Requires** the `supabase` CLI, `jq`, and
+docker (for the local stack); `gh` makes squash open the PR for you.
+
+- **`dork db squash`** — one person consolidates every migration file into a
+  single baseline: preflights that local == linked and that the local schema
+  really matches the files (via a shadow-database diff), snapshots the linked
+  project's bookkeeping to /tmp for rollback, runs
+  `supabase migration squash --linked`, re-attaches DDL a pg_dump can't emit
+  (see the fences below), gates the result on a clean
+  `supabase db diff --linked --schema public`, then commits on its own branch
+  and opens the PR.
+- **`dork db repair --local`** — everyone else runs this after pulling (or
+  wires `dork db repair --auto-local` into dev startup so it's hands-free).
+  It reconciles the local bookkeeping, refuses to record anything the actual
+  schema doesn't back up, and when the DB turns out to have been **behind**
+  the squash it offers a catch-up: the deleted migrations are recovered from
+  git history and replayed in ONE transaction. Works from any state — your
+  own unapplied migration files included.
+- **`dork db repair --verify-local`** — read-only shadow-DB diff of your
+  local schema against the migration files.
+
+**The invariant:** squash and repair only ever change the bookkeeping table
+`supabase_migrations.schema_migrations`. Nothing in `dork db` runs
+`supabase db reset` or `supabase db push`, on any scope, ever — the linked
+(production) project's schema, RLS, data and storage are never touched. The
+one schema-changing operation is the **local** catch-up replay (real
+historical migrations, single transaction, local docker DB only), and even
+that is not a reset: local data stays.
+
+Migration-file markers `dork db` understands (all optional):
+
+```sql
+-- >>> squash-preserve: my_extra_role     ← re-PREPENDED to every new baseline
+create role ...;                          -- (cluster-level DDL pg_dump drops)
+-- <<< squash-preserve
+
+-- >>> squash-append: keep this REVOKE    ← re-APPENDED after the dump body
+revoke ...;                               -- (pg_dump emits ACLs, not REVOKEs)
+-- <<< squash-append
+
+-- dork-db:drops old_table.* other.col    ← declare drops done in DO blocks /
+                                          --   dynamic SQL the parser can't see
+```
+
+`.dork.sh` keys (all optional): `DORK_DB_DEV_CMD` (what boots your local
+stack, for messages), `DORK_DB_DEV_AUTOREPAIR=1` (set when dev startup runs
+`repair --auto-local`), `DORK_DB_REPAIR_CMD` / `DORK_DB_VERIFY_CMD` (how your
+repo spells those commands, e.g. wrapper scripts or npm aliases),
+`DORK_DB_DROPS_TAGS` (extra `-- <tag>:drops` marker tags),
+`DORK_DB_POST_SQUASH_CHECKS` (multi-line project checks printed after a
+squash and put in the PR body), `DORK_DB_PR_BASE` (squash PR base branch).
 
 ## Notes & limitations
 

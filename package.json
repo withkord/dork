@@ -1,7 +1,7 @@
 {
   "name": "@withkord/dork",
-  "version": "0.2.1",
-  "description": "Parallel git worktrees for agentic coding",
+  "version": "0.3.0",
+  "description": "Parallel git worktrees for agentic coding, plus team-safe Supabase migration squash & repair (dork db)",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,10 +15,13 @@
     "claude-code",
     "coding-agent",
     "tmux",
-    "ghostty"
+    "ghostty",
+    "supabase",
+    "migrations"
   ],
   "bin": {
-    "dork": "bin/dork"
+    "dork": "bin/dork",
+    "dork-db": "bin/dork-db"
   },
   "files": [
     "bin",

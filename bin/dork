@@ -13,6 +13,7 @@
 #   dork pr [title] — commit pending changes, push, open a PR (gh pr create)
 #   dork kill [P …] — kill worktree(s) + branch(es); no args: current worktree
 #   dork init       — set up the current repo for dork (config, gitignore, hook)
+#   dork db …       — Supabase migration squash & repair (see bin/dork-db)
 #   dork flow       — print the daily-flow cheat sheet
 #   dork update     — update dork itself (git pull, or npm for npm installs)
 #
@@ -27,7 +28,7 @@
 #
 set -euo pipefail
 
-DORK_VERSION="0.2.1"
+DORK_VERSION="0.3.0"
 
 # Absolute path of this script + the dork checkout that contains it.
 _SRC="${BASH_SOURCE[0]}"
@@ -69,6 +70,11 @@ Usage: $PROG <command>
                starter allow/deny permission set into .claude/settings.json
                (deny rules guard destructive git even in yolo mode); with
                neither flag, an interactive run asks.
+  db <cmd>     Supabase migration squash & repair for the whole team:
+               '$PROG db squash' consolidates every migration file into one
+               baseline; '$PROG db repair' reconciles any teammate's local DB
+               afterwards (metadata-only; never db reset / db push, never
+               data). '$PROG db help' for details.
   flow         Print the daily-flow cheat sheet (worktree → PR → merge → sync).
   update       Update dork itself (git pull, or npm for npm installs).
   version      Print the dork version.
@@ -1279,6 +1285,7 @@ case "$1" in
   pr)          shift; repo_required; cmd_pr "$@" ;;
   kill)        shift; repo_required; cmd_kill "$@" ;;
   init)        shift; repo_required; cmd_init "$@" ;;
+  db)          shift; DORK_PROG="$PROG" exec bash "$DORK_HOME/bin/dork-db" "$@" ;;
   flow)        require_repo || { BASE_PORT=3001; MAX_PORT=3008; }; cmd_flow ;;
   update)      cmd_update ;;
   version|--version|-v) echo "dork $DORK_VERSION" ;;

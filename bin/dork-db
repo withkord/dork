@@ -1,0 +1,1897 @@
+#!/usr/bin/env bash
+#
+# dork db — Supabase migration squash & repair for teams.
+#
+#   dork db squash                Consolidate every migration file into one
+#                                 baseline and reconcile local + linked
+#                                 bookkeeping. Branch + PR included.
+#   dork db repair --local        Reconcile the LOCAL docker DB after pulling a
+#                                 teammate's squash; offers a catch-up replay
+#                                 when the DB was behind the squash.
+#   dork db repair --catchup-local  Go straight to the catch-up replay.
+#   dork db repair --verify-local Read-only: diff the local DB against
+#                                 supabase/migrations/ via a shadow database.
+#   dork db repair --prod         Reconcile the linked project's bookkeeping
+#                                 (recovery; rare). Alias: --linked.
+#   dork db repair --auto-local   Non-interactive dev-startup hook: reverts
+#                                 provably stale rows, never applies or
+#                                 replays, always exits 0.
+#
+# THE INVARIANT EVERYTHING HERE IS BUILT AROUND
+#   A squash and a repair are METADATA-ONLY on any database that matters. The
+#   only state they ever change on the linked (prod) project is the
+#   `supabase_migrations.schema_migrations` bookkeeping table - never the
+#   schema, never RLS, never data, never storage. Nothing in this file runs
+#   `supabase db reset` or `supabase db push`, on any scope, ever. The one
+#   operation that changes a schema at all is the LOCAL catch-up replay, which
+#   runs real historical migration files inside a single transaction on the
+#   local docker DB - and even that is not a reset: local data stays.
+#
+# WHY THE SHAPE IS WHAT IT IS (lessons already paid for)
+#   - Bookkeeping is a CLAIM, not evidence. A DB can hold a row for a version
+#     whose DDL it never ran, and every later `migration up` no-ops forever
+#     while columns are missing. So nothing here marks a baseline applied
+#     until the schema has been checked to actually contain it.
+#   - A table/column comparison is only a pre-filter. Function bodies,
+#     policies, indexes and grants can all be stale while every table and
+#     column lines up. The check that certifies is the CLI's own differ
+#     against a shadow database built from supabase/migrations/.
+#   - Stale bookkeeping rows on a behind DB are the only surviving record of
+#     where that DB actually sits. Reverting them before the schema is proven
+#     destroys the evidence a catch-up needs, so they are left alone until
+#     then.
+#   - CLI output formats change between versions and even between runs. Every
+#     parser here recognizes its input positively and fails LOUDLY on
+#     anything else - a parse failure must never masquerade as "in sync".
+#
+# PROJECT CONFIG - .dork.sh at the repo root (committed), all optional:
+#   DORK_DB_DEV_CMD="supabase start"   What boots the local stack (messages).
+#   DORK_DB_DEV_AUTOREPAIR=""          Set non-empty when the dev command runs
+#                                      `repair --auto-local` on startup, so
+#                                      squash PR notes can say "just run dev".
+#   DORK_DB_REPAIR_CMD=""              How this repo spells the repair
+#                                      entrypoint (messages only), e.g. a
+#                                      wrapper path. Default: "<prog> repair".
+#   DORK_DB_VERIFY_CMD=""              Printed alias for the verify command,
+#                                      e.g. an npm script. Default: the
+#                                      repair entrypoint with --verify-local.
+#   DORK_DB_DROPS_TAGS=""              Extra marker tags recognized in
+#                                      "-- <tag>:drops ..." comments (the
+#                                      built-in tag "dork-db" always works).
+#   DORK_DB_POST_SQUASH_CHECKS=""      Multi-line project-specific
+#                                      verification steps printed (and put in
+#                                      the PR body) after a squash - e.g.
+#                                      regenerate DB types, run unit tests,
+#                                      smoke-test the app.
+#   DORK_DB_PR_BASE=""                 PR base branch for the squash PR.
+#                                      Default: origin/HEAD, then main/master.
+#
+# MIGRATION-FILE MARKERS this tool reads and writes:
+#   -- dork-db:baseline
+#       Written into the new baseline by `squash`. Marks which file IS the
+#       squash baseline, so repair does not have to assume "oldest file" -
+#       an assumption a teammate's own older-timestamped migration breaks.
+#   -- >>> squash-preserve: <what>  ...  -- <<< squash-preserve
+#       Idempotent DDL re-PREPENDED to every new baseline. For cluster-level
+#       objects a pg_dump of the schema cannot emit - CREATE ROLE above all
+#       (the GRANTs to the role survive the dump and then fail because the
+#       role does not exist).
+#   -- >>> squash-append: <what>  ...  -- <<< squash-append
+#       Idempotent DDL re-APPENDED to every new baseline, after the objects
+#       it references. The forcing case: a REVOKE. pg_dump emits a relation's
+#       RESULTING ACL, never the REVOKE that produced it, so a removed
+#       privilege silently returns on every fresh database.
+#   -- dork-db:drops <table>.<column> <table>.* ...
+#       Declares drops performed from inside DO blocks / dynamic SQL, which
+#       the drop-parser cannot see. Only read from migrations NEWER than the
+#       baseline. Extra tags via DORK_DB_DROPS_TAGS.
+#
+set -euo pipefail
+
+# How this program refers to itself in messages. `dork db` execs us with
+# DORK_PROG exported; a direct `dork-db` invocation gets the plain name.
+if [ -n "${DORK_PROG:-}" ]; then SELF="${DORK_PROG} db"; else SELF="dork-db"; fi
+
+log()   { printf '\n>>> %s\n' "$*"; }
+warn()  { printf '\n!!! %s\n' "$*" >&2; }
+# Continuation lines of a warn() block - no blank line, aligned under it.
+more()  { printf '    %s\n' "$*" >&2; }
+abort() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+# ask: yes/no prompt that RETURNS the answer (0 = yes) so the caller can offer
+# a fallback. confirm: the same prompt when "no" means stop.
+ask() {
+  printf '\n%s [y/N] ' "$1"
+  local resp
+  read -r resp
+  case "$resp" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+confirm() { ask "$1" || abort "Aborted by user."; }
+
+# Open a URL in the default browser. Never fatal - a headless box or a missing
+# opener must not fail a flow that already did its real work.
+open_url() {
+  [ -n "${1:-}" ] || return 0
+  if command -v open >/dev/null 2>&1; then          # macOS
+    open "$1" >/dev/null 2>&1 || true
+  elif command -v xdg-open >/dev/null 2>&1; then    # Linux
+    xdg-open "$1" >/dev/null 2>&1 || true
+  fi
+}
+
+# =============================================================================
+# Repo root + project config
+# =============================================================================
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$REPO_ROOT" ] || abort "Not inside a git repository."
+cd "$REPO_ROOT"
+
+# shellcheck disable=SC1091
+if [ -f "$REPO_ROOT/.dork.sh" ]; then source "$REPO_ROOT/.dork.sh"; fi
+
+DEV_CMD="${DORK_DB_DEV_CMD:-supabase start}"
+DEV_AUTOREPAIR="${DORK_DB_DEV_AUTOREPAIR:-}"
+REPAIR_CMD="${DORK_DB_REPAIR_CMD:-$SELF repair}"
+VERIFY_CMD="${DORK_DB_VERIFY_CMD:-$REPAIR_CMD --verify-local}"
+DROPS_TAGS="dork-db ${DORK_DB_DROPS_TAGS:-}"
+POST_SQUASH_CHECKS="${DORK_DB_POST_SQUASH_CHECKS:-}"
+
+# =============================================================================
+# Local Postgres access
+# =============================================================================
+# The supabase CLI can start the stack and shuffle bookkeeping rows, but it
+# has no "run this SQL" command - and both the schema truth-check and the
+# catch-up replay need one (the replay needs a SINGLE transaction spanning
+# many files). So those talk to the local docker Postgres directly. psql on
+# PATH is used when present; otherwise we borrow the one inside the
+# supabase_db_* container, which is always version-matched to the server.
+# LOCAL ONLY - nothing here can reach the linked project.
+
+DDB_LOCAL_DB_URL=""
+DDB_LOCAL_DB_CONTAINER=""
+
+# Resolve connection details ONCE into globals. Call this from a top-level
+# function before any pipeline that uses psql_local: `supabase status` costs a
+# full second, psql_local runs on the right-hand side of pipelines (a
+# subshell), and a cache written in a subshell evaporates - which silently
+# turns the catch-up probe into a one-second-per-trial crawl.
+ensure_local_db_conn() {
+  if [ -z "$DDB_LOCAL_DB_URL" ]; then
+    # `supabase status` prints a JSON blob (plus non-JSON chatter on stderr).
+    DDB_LOCAL_DB_URL=$(supabase status 2>/dev/null | sed -n '/^{/,$p' | jq -r '.DB_URL // empty' 2>/dev/null || true)
+    [ -n "$DDB_LOCAL_DB_URL" ] || DDB_LOCAL_DB_URL="postgresql://postgres:postgres@127.0.0.1:54322/postgres"
+  fi
+  if [ -z "$DDB_LOCAL_DB_CONTAINER" ]; then
+    local id
+    id=$(sed -n 's/^project_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' supabase/config.toml 2>/dev/null | head -1)
+    [ -n "$id" ] || id=$(basename "$PWD")
+    DDB_LOCAL_DB_CONTAINER="supabase_db_${id}"
+  fi
+}
+
+local_db_url()       { ensure_local_db_conn; printf '%s' "$DDB_LOCAL_DB_URL"; }
+local_db_container() { ensure_local_db_conn; printf '%s' "$DDB_LOCAL_DB_CONTAINER"; }
+
+# SQL on stdin; extra psql flags as arguments. ON_ERROR_STOP is always on, so
+# a caller passing --single-transaction gets all-or-nothing semantics.
+psql_local() {
+  ensure_local_db_conn
+  if command -v psql >/dev/null 2>&1; then
+    psql "$DDB_LOCAL_DB_URL" -v ON_ERROR_STOP=1 "$@" -f -
+  else
+    docker exec -i "$DDB_LOCAL_DB_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 "$@" -f -
+  fi
+}
+
+psql_local_query() { printf '%s\n' "$1" | psql_local -Atq 2>/dev/null; }
+
+local_db_reachable() { printf 'select 1;\n' | psql_local -Atq >/dev/null 2>&1; }
+
+# =============================================================================
+# Migration files and versions
+# =============================================================================
+
+migration_files()   { ls supabase/migrations/*.sql 2>/dev/null | sort; }
+version_of()        { basename "$1" | cut -d_ -f1; }
+
+# The BASELINE is the file a squash consolidated everything into - the only
+# version a repair may ever mark applied without running its DDL. Squash
+# stamps it with a "-- dork-db:baseline" marker so it can be identified even
+# when a teammate's own migration carries an OLDER timestamp (rebasing an
+# unpushed migration under a fresh squash does exactly that, and the old
+# "baseline = oldest file" assumption then points at the wrong file). Newest
+# marked file wins; oldest file is the fallback for pre-marker baselines.
+# Prints nothing and still returns 0 when there are no migrations at all, so
+# callers can abort with their own message instead of dying inside a command
+# substitution under `set -e`.
+baseline_file() {
+  local marked
+  marked=$(grep -l '^-- dork-db:baseline' supabase/migrations/*.sql 2>/dev/null | sort | tail -1 || true)
+  if [ -n "$marked" ]; then printf '%s\n' "$marked"; return 0; fi
+  migration_files | head -1 || true
+}
+baseline_version()  { local f; f=$(baseline_file); [ -n "$f" ] && version_of "$f"; return 0; }
+file_for_version()  { ls "supabase/migrations/$1"_*.sql 2>/dev/null | head -1 || true; }
+
+applied_versions_local() { psql_local_query "select version from supabase_migrations.schema_migrations order by version;"; }
+max_applied_local()      { applied_versions_local | tail -1; }
+
+# Migration files whose version sorts BEFORE the baseline. Only possible when
+# the baseline marker identified a non-oldest file: these are local/branch
+# migrations that predate the squash. Supabase applies migrations in filename
+# order, so they need renaming past the baseline before `migration up` can
+# run them anywhere.
+files_before_baseline() {
+  local baseline f v
+  baseline=$(baseline_version)
+  [ -n "$baseline" ] || return 0
+  for f in $(migration_files); do
+    v=$(version_of "$f")
+    [ "$v" \< "$baseline" ] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+# The standing advice for an out-of-order migration file.
+rename_hint() {
+  more "Rename it past the baseline so 'supabase migration up' can order it:"
+  more "  mv $1 supabase/migrations/\$(date +%Y%m%d%H%M%S)_$(basename "$1" | cut -d_ -f2-)"
+}
+
+# Write every current bookkeeping row out as restorable INSERTs before we
+# delete any of them. Reverting a row is one CLI call and takes a second;
+# working out afterwards WHICH rows a DB used to have is archaeology. Prints
+# the receipt path; silent + non-zero if it can't.
+backup_schema_migrations_local() {
+  local out="/tmp/dork_db_schema_migrations_$(date +%Y%m%d_%H%M%S).sql"
+  local rows
+  rows=$(psql_local_query "select 'insert into supabase_migrations.schema_migrations(version) values (''' || version || ''') on conflict do nothing;' from supabase_migrations.schema_migrations order by version;")
+  [ -n "$rows" ] || return 1
+  {
+    printf -- '-- supabase_migrations.schema_migrations on the LOCAL docker DB, %s\n' "$(date)"
+    printf -- '-- restore with: psql "%s" -f %s\n\n' "$(local_db_url)" "$out"
+    printf '%s\n' "$rows"
+  } > "$out" || return 1
+  printf '%s' "$out"
+}
+
+# =============================================================================
+# Schema truth-check
+# =============================================================================
+# Print "<table>.<column>" for every column the squash BASELINE file declares
+# that the local DB does not actually have. Empty output = the local schema
+# really does contain the baseline; output = the bookkeeping is (or is about
+# to become) a lie. One query and one awk pass - no shadow DB - so it is
+# cheap enough to run on every dev start. `supabase db diff --local --schema
+# public` is the exhaustive version (it also sees policies, functions and
+# indexes) and runs where the extra ~30s is worth it.
+#
+# Returns non-zero WITHOUT output when the DB can't be read - callers must
+# treat that as "unknown", never as "no gaps" and never as "everything is
+# missing".
+#
+# What the baseline declares is not the whole truth: a migration NEWER than
+# the baseline may have deliberately dropped something the baseline still
+# creates, and a DB that ran it is AHEAD, not behind. Left uncorrected the
+# check inverts - it reports the drop as a gap, repair concludes "this DB was
+# behind when the squash landed" and offers to replay history that is already
+# applied. So subtract the post-baseline drops before comparing.
+baseline_schema_gaps() {
+  local bf; bf=$(baseline_file)
+  [ -n "$bf" ] || return 1
+  ensure_local_db_conn
+
+  local actual
+  actual=$(psql_local_query "select table_name || '.' || column_name from information_schema.columns where table_schema = 'public';")
+  [ -n "$actual" ] || return 1   # stack down, or no public schema at all - unknown
+
+  local declared_f actual_f dropped_f
+  declared_f=$(mktemp); actual_f=$(mktemp); dropped_f=$(mktemp)
+  # Baselines are `supabase db dump` output: CREATE TABLE [IF NOT EXISTS]
+  # "public"."t" ( followed by one "col" ... line per column until a line
+  # starting with ')'. Constraint lines don't start with a quote, so they
+  # fall out on their own.
+  awk '
+    { up = toupper($0) }
+    up ~ /^[[:space:]]*CREATE TABLE/ && $0 ~ /"public"\."/ {
+      t = $0; sub(/^.*"public"\."/, "", t); sub(/".*$/, "", t); intbl = 1; next
+    }
+    intbl && /^[[:space:]]*\)/ { intbl = 0; next }
+    intbl && /^[[:space:]]*"/ {
+      c = $0; sub(/^[[:space:]]*"/, "", c); sub(/".*$/, "", c); print t "." c
+    }
+  ' "$bf" | sort -u > "$declared_f"
+  printf '%s\n' "$actual" | sort -u > "$actual_f"
+  baseline_post_drops "$declared_f" | sort -u > "$dropped_f"
+
+  comm -23 "$declared_f" "$actual_f" | comm -23 - "$dropped_f"
+  rm -f "$declared_f" "$actual_f" "$dropped_f"
+}
+
+# Print "<table>.<column>" for everything the baseline declares that a LATER
+# migration drops on purpose - a dropped table expands to all of its declared
+# columns, so `$1` is the declared list to expand against.
+#
+# Deliberately literal about common drop shapes (`drop table`, `drop column`,
+# quoted or bare, with or without `if exists` / `public.`) rather than trying
+# to parse SQL. A shape it misses degrades to a false "gap" that repair
+# REPORTS rather than silently ignores - so being incomplete here is safe,
+# and being over-eager would not be.
+#
+# A migration that drops something from inside a DO block / dynamic SQL is
+# unparseable by design, so it declares the drop instead:
+#
+#   -- dork-db:drops table_a.col_x table_b.col_y
+#   -- dork-db:drops old_table.*
+#
+# `table.column` names one column, `table.*` (or a bare `table`) the whole
+# table. The marker is only ever read from migrations NEWER than the
+# baseline. Projects can register extra tags via DORK_DB_DROPS_TAGS.
+baseline_post_drops() {
+  local declared_f="$1" baseline f tag
+  baseline=$(baseline_version)
+  [ -n "$baseline" ] || return 0
+
+  for f in $(migration_files); do
+    [ "$(version_of "$f")" \> "$baseline" ] || continue
+
+    # Declared drops: the escape hatch for dynamic SQL.
+    for tag in $DROPS_TAGS; do
+      grep -Eio -- "--[[:space:]]*${tag}:drops[[:space:]]+.*\$" "$f" 2>/dev/null \
+        | sed -E "s/^.*${tag}:drops[[:space:]]+//" \
+        | tr ' \t' '\n\n' \
+        | while read -r tok; do
+            [ -n "$tok" ] || continue
+            case "$tok" in
+              *.\*)  grep -E "^${tok%.*}\." "$declared_f" 2>/dev/null || true ;;
+              *.*)   printf '%s\n' "$tok" ;;
+              *)     grep -E "^${tok}\." "$declared_f" 2>/dev/null || true ;;
+            esac
+          done
+    done
+
+    # drop table [if exists] [public.]<name>  ->  every declared column of it
+    grep -Eio 'drop[[:space:]]+table[[:space:]]+(if[[:space:]]+exists[[:space:]]+)?("?public"?\.)?"?[a-z0-9_]+"?' "$f" 2>/dev/null \
+      | sed -E 's/.*[. ]"?([a-z0-9_]+)"?$/\1/' \
+      | while read -r t; do
+          [ -n "$t" ] && grep -E "^${t}\." "$declared_f" 2>/dev/null || true
+        done
+
+    # alter table [public.]<t> ... drop column [if exists] <c>
+    grep -Eio 'alter[[:space:]]+table[[:space:]]+(only[[:space:]]+)?("?public"?\.)?"?[a-z0-9_]+"?[[:space:]]+drop[[:space:]]+column[[:space:]]+(if[[:space:]]+exists[[:space:]]+)?"?[a-z0-9_]+"?' "$f" 2>/dev/null \
+      | sed -E 's/^.*table[[:space:]]+(only[[:space:]]+)?("?public"?\.)?"?([a-z0-9_]+)"?[[:space:]]+drop[[:space:]]+column[[:space:]]+(if[[:space:]]+exists[[:space:]]+)?"?([a-z0-9_]+)"?.*$/\3.\5/I' \
+      || true
+  done
+}
+
+# Human summary of the gap check for the local DB. Echoes a one-line verdict
+# and returns: 0 = schema contains the baseline, 1 = gaps found, 2 = unknown.
+report_baseline_gaps_local() {
+  local gaps rc=0
+  gaps=$(baseline_schema_gaps) || rc=2
+  [ "$rc" -eq 2 ] && { echo "  schema check: SKIPPED (local DB not reachable)"; return 2; }
+  if [ -z "$gaps" ]; then
+    echo "  schema check: ok - the local schema really does contain $(baseline_version)"
+    return 0
+  fi
+  local n; n=$(printf '%s\n' "$gaps" | wc -l | tr -d ' ')
+  warn "The local schema is MISSING ${n} column(s)/table(s) that the baseline $(baseline_version) declares, e.g.:"
+  printf '%s\n' "$gaps" | head -8 | sed 's/^/      /' >&2
+  [ "$n" -gt 8 ] && echo "      ... and $((n - 8)) more" >&2
+  return 1
+}
+
+# Parse `supabase migration list <scope>` and print rows that are NOT in sync.
+# Fields in each JSON row:
+#   "local"  = file in supabase/migrations/
+#   "remote" = row in <scope>'s supabase_migrations.schema_migrations table
+# Output: "L <version>" = file but no DB row; "R <version>" = DB row but no file.
+#
+# CLI >= 2.x is SUPPOSED to emit JSON on stdout whenever stdout is not a TTY -
+# which it never is inside $(...) capture - and backtick-quotes versions in
+# the pretty table, so table-scraping awk can silently return "no drift" on
+# every run. Do NOT "fix" the JSON path by passing --output json: on some 2.x
+# releases that flag paradoxically re-routes the human table to stdout
+# instead, and those releases also INTERMITTENTLY emit the pretty table even
+# in capture. So we handle BOTH: parse JSON when we get it, parse the pretty
+# table when we positively recognize it, and fail LOUDLY only on genuinely
+# unknown output - a parse failure must never masquerade as "in sync".
+parse_drift() {
+  local scope="$1"
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "jq is required to parse 'supabase migration list' output but was not found."
+    return 1
+  fi
+  local raw
+  raw=$(supabase migration list "$scope" 2>/dev/null)
+
+  # Primary path: the default non-TTY output on CLI 2.x is JSON.
+  if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    printf '%s' "$raw" | jq -r '
+      .migrations[]?
+      | if .local != "" and .remote == "" then "L \(.local)"
+        elif .local == "" and .remote != "" then "R \(.remote)"
+        else empty
+        end
+    '
+    return 0
+  fi
+
+  # Fallback: the human "pretty table", parsed ONLY when we positively
+  # recognize it by its header. The table backtick-quotes 14-digit versions;
+  # a blank Local cell = drift "R" material, a blank Remote cell = "L".
+  if printf '%s' "$raw" | grep -qE 'Local[[:space:]]*\|[[:space:]]*Remote'; then
+    printf '%s\n' "$raw" | awk -F'|' '
+      {
+        l = $1; r = $2
+        gsub(/[^0-9]/, "", l); gsub(/[^0-9]/, "", r)
+        if (length(l) != 14 && length(r) != 14) next        # header / separator / blank
+        if (length(l) == 14 && length(r) != 14) print "L " l # file, no DB row
+        else if (length(l) != 14 && length(r) == 14) print "R " r # DB row, no file
+      }
+    '
+    return 0
+  fi
+
+  warn "Unrecognized output from 'supabase migration list ${scope}' (neither JSON nor the pretty table - CLI version change?):"
+  printf '%s\n' "$raw" | head -5 >&2
+  return 1
+}
+
+# =============================================================================
+# The migration ledger - every migration that ever existed, recovered from git
+# =============================================================================
+# Print "<version><TAB><source>" oldest first, where <source> is
+# "git:<rev>:<path>" or "file:<path>". Always the INCREMENTAL form of a
+# migration, never the full-schema rewrite that a squash left in its place.
+#
+# How it finds them: a squash is the only thing that deletes migration files,
+# so every commit with a deletion under supabase/migrations/ is a squash
+# boundary, and its PARENT tree holds the files that squash consumed. A
+# version's earliest boundary tree therefore always holds it in incremental
+# form - the squash that rewrote it into a dump IS the boundary whose parent
+# we are reading, and any later tree (or the working tree) holds only the
+# rewrite. So: collect every (version, boundary) pair, sort by version then
+# boundary date, keep the first. Order-independent, which matters because
+# rebases make `git log` order and author dates disagree.
+migration_ledger() {
+  local tmp; tmp=$(mktemp)
+  git log --format='%H %ct' --diff-filter=D -- supabase/migrations/ 2>/dev/null \
+  | while read -r sha ct; do
+      # Skip a root commit (no parent tree to read).
+      git rev-parse -q --verify "${sha}^^{commit}" >/dev/null 2>&1 || continue
+      git ls-tree --name-only "${sha}^" supabase/migrations/ 2>/dev/null \
+      | while IFS= read -r path; do
+          case "$path" in *.sql) ;; *) continue ;; esac
+          local v; v=$(basename "$path" | cut -d_ -f1)
+          case "$v" in ''|*[!0-9]*) continue ;; esac
+          printf '%s\t%s\tgit:%s^:%s\n' "$v" "$ct" "$sha" "$path"
+        done
+    done > "$tmp"
+
+  # Files still in the tree. The far-future timestamp means they only win for
+  # versions no squash boundary ever saw - i.e. migrations added since the
+  # last squash, which are still incremental. The squashed baseline loses to
+  # its own pre-squash copy, which is the whole point.
+  local path v
+  for path in $(migration_files); do
+    v=$(version_of "$path")
+    printf '%s\t9999999999\tfile:%s\n' "$v" "$path" >> "$tmp"
+  done
+
+  sort -t"$(printf '\t')" -k1,1n -k2,2n "$tmp" | awk -F'\t' '!seen[$1]++ { print $1 "\t" $3 }'
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# Catch-up internals. The ledger lives in globals because bash arrays cannot
+# be returned, and every helper below indexes into the same one.
+# ---------------------------------------------------------------------------
+DDB_L_N=0            # number of ledger entries
+DDB_L_VER=()         # version per index
+DDB_L_SRC=()         # "git:<rev>:<path>" | "file:<path>" per index
+DDB_L_SQL=()         # materialized local path per index
+DDB_L_DIR=""         # temp dir holding the materialized SQL
+DDB_L_START=-1       # index the probe settled on
+DDB_TRIAL_ERR=""     # first error from the last failed trial
+
+# Load the ledger (up to and including the baseline) into the globals and
+# materialize each entry's SQL. Versions NEWER than the baseline still have
+# files and belong to `supabase migration up`, not here.
+ledger_load() {
+  local baseline="$1" v src i
+  DDB_L_N=0; DDB_L_VER=(); DDB_L_SRC=(); DDB_L_SQL=()
+  while IFS="$(printf '\t')" read -r v src; do
+    [ -n "$v" ] || continue
+    [ "$v" -le "$baseline" ] || continue
+    DDB_L_VER[$DDB_L_N]="$v"
+    DDB_L_SRC[$DDB_L_N]="$src"
+    DDB_L_N=$((DDB_L_N + 1))
+  done < <(migration_ledger)
+  [ "$DDB_L_N" -gt 0 ] || return 1
+
+  DDB_L_DIR=$(mktemp -d)
+  i=0
+  while [ "$i" -lt "$DDB_L_N" ]; do
+    src="${DDB_L_SRC[$i]}"
+    DDB_L_SQL[$i]="$DDB_L_DIR/$(printf '%04d' "$i").sql"
+    case "$src" in
+      git:*)  git show "${src#git:}" > "${DDB_L_SQL[$i]}" 2>/dev/null || return 1 ;;
+      file:*) cp "${src#file:}" "${DDB_L_SQL[$i]}" || return 1 ;;
+    esac
+    i=$((i + 1))
+  done
+  return 0
+}
+
+ledger_label() { printf '%s  %s' "${DDB_L_VER[$1]}" "$(basename "${DDB_L_SRC[$1]}")"; }
+
+# Paths of ledger entries [$1..$2] as a plain word list (for grep).
+ledger_paths() {
+  local i="$1"
+  while [ "$i" -le "$2" ]; do printf '%s ' "${DDB_L_SQL[$i]}"; i=$((i + 1)); done
+}
+
+ledger_stream() {  # $1..$2 = inclusive index range, concatenated to stdout
+  local i="$1"
+  while [ "$i" -le "$2" ]; do
+    printf '\n-- ===== %s =====\n' "${DDB_L_SRC[$i]}"
+    cat "${DDB_L_SQL[$i]}"
+    i=$((i + 1))
+  done
+}
+
+# Trial-apply ledger[$1..$2]. ALWAYS rolls back: the stream ends with a RAISE
+# that aborts the transaction, so the only way to "succeed" is for every
+# statement before it to have been accepted by Postgres. Returns 0 on a clean
+# trial. Nothing is ever written, which is what makes probing safe.
+trial_apply() {
+  local out rc=0
+  out=$(mktemp)
+  {
+    ledger_stream "$1" "$2"
+    printf '\nDO $ddb_probe$ BEGIN RAISE EXCEPTION %s; END $ddb_probe$;\n' "'DDB_TRIAL_ROLLBACK'"
+  } 2>/dev/null | psql_local --single-transaction -q > "$out" 2>&1 || rc=$?
+  if grep -q 'DDB_TRIAL_ROLLBACK' "$out"; then rm -f "$out"; return 0; fi
+  DDB_TRIAL_ERR=$(grep -m1 'ERROR:' "$out" 2>/dev/null | sed 's/^psql:[^ ]*: *//' || true)
+  rm -f "$out"
+  return 1
+}
+
+# Find the EARLIEST ledger index whose whole suffix applies cleanly - that is
+# at or before where this DB actually sits. Everything before it is already
+# in the schema (its DDL would collide); everything after it depends on it.
+# The cheap single-file trial filters the already-applied prefix so the
+# expensive full-suffix trial usually runs once or twice.
+#
+# Earliest, not latest, on purpose: overshooting backwards only re-runs
+# migrations that are idempotent by construction (that is WHY they applied
+# cleanly onto a DB that already has them - `add column if not exists`,
+# `create or replace function`, an UPDATE that re-derives the same value),
+# and Postgres has just proven the whole set runs without error. Overshooting
+# forwards would silently skip a migration and leave the schema subtly wrong,
+# which is the failure this whole tool exists to prevent.
+ledger_probe() {
+  local i="$1" checked=0
+  DDB_L_START=-1
+  while [ "$i" -lt "$DDB_L_N" ]; do
+    checked=$((checked + 1))
+    if [ $((checked % 25)) -eq 0 ]; then printf '    ... probed %s of %s\n' "$checked" "$DDB_L_N"; fi
+    if trial_apply "$i" "$i" && trial_apply "$i" "$((DDB_L_N - 1))"; then
+      DDB_L_START="$i"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# One failure shape deserves its own explanation: an enum value added by one
+# migration and USED by a later one cannot replay inside a single
+# transaction ("unsafe use of new value ... of enum type"), even though the
+# same files ran fine historically in separate transactions. The probe and
+# the replay both hit it; naming it saves the reader a Postgres deep-dive.
+explain_enum_txn_error() {
+  case "${DDB_TRIAL_ERR:-}" in
+    *unsafe\ use\ of\ new\ value*)
+      more "This is the single-transaction enum limitation: a migration in the range"
+      more "adds an enum value that a later one uses, and Postgres refuses that inside"
+      more "one transaction. Apply the files by hand from git (each in its own"
+      more "transaction), then re-run '${REPAIR_CMD} --local' to reconcile." ;;
+  esac
+}
+
+# Best-effort full dump of the local DB before a replay. The replay itself is
+# one transaction (all-or-nothing), so this is belt-and-braces - but a
+# migration that applies cleanly can still drop a column you cared about
+# locally.
+backup_local_db() {
+  local out="/tmp/dork_db_local_db_$(date +%Y%m%d_%H%M%S).sql"
+  if docker exec "$(local_db_container)" pg_dump -U postgres -d postgres > "$out" 2>/dev/null && [ -s "$out" ]; then
+    printf '%s' "$out"; return 0
+  fi
+  rm -f "$out"; return 1
+}
+
+# Exhaustive verification: the CLI replays supabase/migrations/ into a
+# throwaway shadow DB and diffs it against the local one, so it sees
+# policies, functions, indexes, grants and defaults that
+# baseline_schema_gaps() cannot - that one compares
+# information_schema.columns and nothing else, in one direction only.
+#
+# That blind spot is not theoretical: a DB can carry function bodies from
+# before a change and pass every table/column check for days - the function
+# exists, it just does the wrong thing. So THIS is the check that certifies,
+# and the column check is only ever a fast pre-filter. Costs a
+# shadow-database build (~30s) and needs docker.
+#
+# Returns 0 = clean, 1 = differences found, 2 = could not run (docker down,
+# CLI failure) - which must never be confused with "clean" OR with "dirty".
+# The diff text is left in DDB_DEEP_DIFF for the caller to print.
+#
+# DIRECTION MATTERS, and it is what keeps this usable. `db diff --local`
+# prints the SQL that would turn the shadow (built from supabase/migrations/)
+# into the local DB, so:
+#
+#   drop statements  = the migration files declare something local DOES NOT
+#                      HAVE. Never benign.
+#   create statements = local has something the files do not declare. Routine
+#                      when several worktrees share one local database:
+#                      objects created by another branch's migration live in
+#                      your database while its file is absent from your tree.
+#
+# Treating those the same would make the check cry wolf on every
+# multi-worktree boot, and a check that cries wolf gets ignored. So the count
+# of drop statements is published separately in DDB_DEEP_DROPS, and only that
+# count gates anything.
+DDB_DEEP_DIFF=""
+DDB_DEEP_DROPS=0
+local_schema_deep_check() {
+  DDB_DEEP_DIFF=""
+  DDB_DEEP_DROPS=0
+  local out rc=0
+  out=$(supabase db diff --local --schema public 2>&1) || rc=$?
+  DDB_DEEP_DIFF="$out"
+  # `db diff` exits non-zero only when it could not RUN; a dirty schema is a
+  # successful run with content. Anything else would let a broken CLI read as
+  # a verdict, which is the failure mode this whole function exists to
+  # prevent.
+  [ "$rc" -ne 0 ] && return 2
+  printf '%s' "$out" | grep -q "No schema changes found" && return 0
+
+  # The CLI publishes the drop statements as their own array - no SQL parsing.
+  local json
+  json=$(printf '%s\n' "$out" | grep '^{' | tail -1)
+  if [ -n "$json" ] && command -v jq >/dev/null 2>&1; then
+    DDB_DEEP_DROPS=$(printf '%s' "$json" | jq -r '.dropStatements | length' 2>/dev/null || echo 0)
+  fi
+  [ -n "$DDB_DEEP_DROPS" ] || DDB_DEEP_DROPS=0
+  return 1
+}
+
+# Did the last deep check find things the migration files declare and the
+# local DB lacks? That is the half that is never explained by a branch
+# migration.
+deep_check_found_missing() { [ "${DDB_DEEP_DROPS:-0}" -gt 0 ]; }
+
+# `db diff` puts progress chatter, a CLI-upgrade nag and a JSON envelope on
+# stdout together. Only the envelope's .diff is worth showing a human -
+# printing the lot buries the one line that says which function drifted.
+deep_diff_text() {
+  local json out
+  json=$(printf '%s\n' "$DDB_DEEP_DIFF" | grep '^{' | tail -1)
+  if [ -n "$json" ] && command -v jq >/dev/null 2>&1; then
+    out=$(printf '%s' "$json" | jq -r '.diff // empty' 2>/dev/null || true)
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+  fi
+  printf '%s\n' "$DDB_DEEP_DIFF"
+}
+
+# Just the drop statements, one per line - the objects the migration files
+# declare and this database does not have. Read them as a list of what is
+# MISSING: `db diff` prints the SQL that would make the shadow match local,
+# so "drop policy X" means local has no policy X. That inversion is confusing
+# enough that every caller labels it before printing.
+deep_diff_missing_text() {
+  local json out
+  json=$(printf '%s\n' "$DDB_DEEP_DIFF" | grep '^{' | tail -1)
+  if [ -n "$json" ] && command -v jq >/dev/null 2>&1; then
+    out=$(printf '%s' "$json" | jq -r '.dropStatements[]?' 2>/dev/null || true)
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+  fi
+  deep_diff_text
+}
+
+# Printing wrapper - the advisory form used at the tail of a catch-up.
+verify_local_schema_deep() {
+  local rc=0
+  local_schema_deep_check || rc=$?
+  case "$rc" in
+    0) echo "  db diff --local --schema public: clean"; return 0 ;;
+    2) warn "db diff --local --schema public could not run - schema NOT verified."
+       printf '%s\n' "$DDB_DEEP_DIFF" | head -10 >&2
+       return 2 ;;
+  esac
+  warn "db diff --local --schema public is NOT clean. Residual differences:"
+  deep_diff_text | head -40 >&2
+  more "(A handful of local-only objects here is normal. Whole tables or columns is not -"
+  more " if you see those, say so before running anything else.)"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# The verification stamp
+# ---------------------------------------------------------------------------
+# The deep check is too slow to run on every dev start, and "remember to run
+# it" is not a control - it fails exactly when someone is busy. So the
+# verdict is recorded, keyed by the CONTENT of supabase/migrations/, and
+# re-run only when that content changes. Keying on the file list rather than
+# the baseline version means an ordinary pulled migration re-arms it too, not
+# just a squash.
+#
+# supabase/.temp/ is gitignored and already holds machine-local CLI state.
+DDB_SCHEMA_STAMP="supabase/.temp/local-schema-verified"
+
+migrations_fingerprint() {
+  migration_files | xargs -n1 basename 2>/dev/null | shasum 2>/dev/null | cut -c1-12
+}
+
+schema_stamp_write() {
+  mkdir -p "$(dirname "$DDB_SCHEMA_STAMP")" 2>/dev/null || return 0
+  printf '%s %s\n' "$1" "$2" > "$DDB_SCHEMA_STAMP" 2>/dev/null || true
+}
+
+schema_stamp_clear() { rm -f "$DDB_SCHEMA_STAMP" 2>/dev/null || true; }
+
+# Run the deep check, print a verdict, and record it. Returns the tri-state.
+deep_verify_local() {
+  local fp; fp=$(migrations_fingerprint)
+  local rc=0
+  local_schema_deep_check || rc=$?
+  case "$rc" in
+    0) echo "  deep check: ok - the local schema matches supabase/migrations/"
+       schema_stamp_write "$fp" clean ;;
+    1) if deep_check_found_missing; then schema_stamp_write "$fp" dirty
+       else schema_stamp_write "$fp" extra; fi ;;
+    *) schema_stamp_clear ;;   # unknown: do not record a verdict we don't have
+  esac
+  return "$rc"
+}
+
+# =============================================================================
+# Catch-up: replay the migrations a squash deleted
+# =============================================================================
+# $1 (optional) = a TRUSTED floor version: the DB's max bookkeeping row,
+# passed only when no baseline row has been faked yet, in which case the
+# probe can start straight after it instead of scanning history from the
+# beginning.
+catchup_local() {
+  local trusted="${1:-}"
+  local baseline; baseline=$(baseline_version)
+  [ -n "$baseline" ] || abort "supabase/migrations/ is empty - nothing to catch up to."
+  ensure_local_db_conn
+  local_db_reachable || abort "Local Supabase stack is not reachable. Start it ('${DEV_CMD}' or 'supabase start') and re-run."
+
+  log "Catch-up on the local docker DB - target baseline ${baseline}"
+  local gaps_rc=0
+  report_baseline_gaps_local || gaps_rc=$?
+  if [ "$gaps_rc" -eq 0 ]; then
+    # Same trap as in repair(): every table and column can be present while
+    # function bodies, policies, indexes and grants are still stale. Confirm
+    # with the real differ before declaring there is nothing to replay.
+    echo "  running the deep check (shadow database, ~30s) before declaring this DB current"
+    local deep_rc=0
+    deep_verify_local || deep_rc=$?
+    if [ "$deep_rc" -eq 0 ]; then
+      log "Nothing to replay - the local schema already contains the baseline."
+      reconcile_bookkeeping --local verified
+      return 0
+    fi
+    if [ "$deep_rc" -ge 2 ]; then
+      warn "Could not run the deep check. Treating the column check as the last word."
+      log "Nothing to replay - the local schema appears to contain the baseline."
+      reconcile_bookkeeping --local verified
+      return 0
+    fi
+    if ! deep_check_found_missing; then
+      log "Nothing to replay - the local schema contains everything the files declare."
+      echo "  (It also carries objects they do not declare - normal with several worktrees.)"
+      reconcile_bookkeeping --local verified
+      return 0
+    fi
+    warn "Tables and columns line up, but ${DDB_DEEP_DROPS} object(s) the files declare are missing:"
+    deep_diff_missing_text | sed 's/^/      /' | head -20 >&2
+    more "Continuing into the replay - that is what restores stale function bodies and policies."
+  fi
+  [ "$gaps_rc" -eq 2 ] && abort "Could not read the local schema - refusing to guess. Is the local stack running?"
+
+  log "Rebuilding the migration ledger from git"
+  ledger_load "$baseline" || abort "No migration history found in git under supabase/migrations/ (shallow clone?)."
+  echo "  ${DDB_L_N} migration(s) on record, ending at ${DDB_L_VER[$((DDB_L_N - 1))]}"
+
+  local from=0
+  if [ -n "$trusted" ]; then
+    while [ "$from" -lt "$DDB_L_N" ] && [ "${DDB_L_VER[$from]}" -le "$trusted" ]; do from=$((from + 1)); done
+    if [ "$from" -lt "$DDB_L_N" ]; then
+      echo "  bookkeeping puts this DB at ${trusted}; probing from ${DDB_L_VER[$from]} first"
+    else
+      from=0
+    fi
+  fi
+
+  log "Probing where this DB actually sits (every trial rolls back - nothing is written)"
+  if ! ledger_probe "$from"; then
+    if [ "$from" -ne 0 ] && ledger_probe 0; then
+      : # the hint was wrong; the full scan found it
+    else
+      warn "No point in the recorded history replays cleanly onto this DB."
+      more "Last error from the closest attempt: ${DDB_TRIAL_ERR:-none}"
+      explain_enum_txn_error
+      abort "This DB has drifted in a way catch-up cannot repair automatically. Nothing was changed."
+    fi
+  fi
+  local start="$DDB_L_START" end=$((DDB_L_N - 1))
+  echo "  this DB sits just before ${DDB_L_VER[$start]}"
+
+  # Statements that cannot run inside a transaction would break the
+  # all-or-nothing guarantee, so refuse rather than half-apply.
+  local hostile
+  hostile=$(grep -liE 'concurrently|^[[:space:]]*(commit|rollback)[[:space:]]*;' \
+    $(ledger_paths "$start" "$end") 2>/dev/null || true)
+  if [ -n "$hostile" ]; then
+    warn "These migrations contain statements that cannot run inside a transaction:"
+    printf '%s\n' "$hostile" | sed 's/^/      /' >&2
+    abort "Refusing to replay - an interrupted run could half-apply. Apply them by hand from git."
+  fi
+
+  log "Plan: replay $((end - start + 1)) migration(s) recovered from git, in ONE transaction"
+  local i="$start"
+  while [ "$i" -le "$end" ]; do
+    printf '      %s\n' "$(ledger_label "$i")"
+    i=$((i + 1))
+  done
+  echo
+  echo "  These are the real migration files, in their original order, exactly as they"
+  echo "  ran on every other machine. All-or-nothing: any error rolls the whole set back."
+  echo "  This is NOT 'db reset' - your local data stays where it is."
+  echo "  The first one or two may already be applied here; they are on the list only"
+  echo "  because they are idempotent, and re-running them is a no-op. Catch-up starts at"
+  echo "  the earliest point that still applies cleanly so it cannot skip anything."
+  confirm "Apply them to the LOCAL docker DB now?"
+
+  local backup
+  backup=$(backup_local_db) || backup=""
+  if [ -n "$backup" ]; then echo "  pre-replay dump: ${backup}"; else warn "Could not take a pre-replay pg_dump (continuing - the replay is still atomic)."; fi
+
+  log "Replaying"
+  if ! { ledger_stream "$start" "$end"
+         i="$start"
+         while [ "$i" -le "$end" ]; do
+           # Only versions that still HAVE a file get a bookkeeping row; the
+           # rest were consumed by the squash and would be reverted as
+           # orphans anyway.
+           if [ -n "$(file_for_version "${DDB_L_VER[$i]}")" ]; then
+             printf "\ninsert into supabase_migrations.schema_migrations(version) values ('%s') on conflict do nothing;\n" "${DDB_L_VER[$i]}"
+           fi
+           i=$((i + 1))
+         done
+       } | psql_local --single-transaction -q; then
+    warn "The replay failed and was rolled back in full - the database is untouched."
+    [ -n "$backup" ] && warn "(Pre-replay dump is still at ${backup}.)"
+    abort "Catch-up aborted."
+  fi
+  echo "  applied ${DDB_L_VER[$start]} .. ${DDB_L_VER[$end]}"
+
+  log "Verifying the result"
+  local post_rc=0
+  report_baseline_gaps_local || post_rc=$?
+  [ "$post_rc" -eq 1 ] && abort "The schema still does not match the baseline. Do not run anything else - show this output first."
+  verify_local_schema_deep || true
+
+  reconcile_bookkeeping --local verified
+  rm -rf "$DDB_L_DIR"
+
+  cat <<EOF
+
+================================================================================
+ Catch-up complete. The local DB now carries the same schema as ${baseline}.
+================================================================================
+  Pre-replay dump: ${backup:-<none>}
+EOF
+  if [ -n "$POST_SQUASH_CHECKS" ]; then
+    echo "  Next, verify nothing else changed:"
+    printf '%s\n' "$POST_SQUASH_CHECKS" | sed 's/^/    /'
+  fi
+}
+
+# Reconcile drift: Remote-only (DB row w/o file) → mark REVERTED. Local-only
+# (file w/o DB row) → mark APPLIED, but ONLY for the baseline file: after a
+# squash that is the one file whose DDL a healthy DB legitimately already
+# contains. Any NEWER file with no row has never run on this DB - marking it
+# applied would turn "unapplied migration" (fixable with `migration up`) into
+# silent schema drift, so those are skipped with instructions instead. A file
+# OLDER than the baseline is a local/branch migration that predates the
+# squash and needs RENAMING past it - a different problem with different
+# instructions. Idempotent - runs as a no-op when synced.
+#
+# This is the MECHANICAL half: it trusts its caller that marking the baseline
+# applied is legitimate. Everything goes through repair() below, which earns
+# that trust by checking the schema first. $2 = "verified" when the caller
+# has just proven (or just made) the schema contain the baseline.
+reconcile_bookkeeping() {
+  local scope="$1"
+  local verified="${2:-}"
+  local desc; if [ "$scope" = "--local" ]; then desc="local Supabase stack (docker)"; else desc="linked remote project"; fi
+
+  log "Reconciling migration bookkeeping on ${desc} - metadata-only (schema, RLS, data, storage untouched)"
+  local drift; drift=$(parse_drift "$scope")
+  local to_apply to_revert
+  to_apply=$(echo "$drift"  | awk '/^L /{print $2}')   # file, no DB row
+  to_revert=$(echo "$drift" | awk '/^R /{print $2}')   # DB row, no file → reverted
+
+  if [ -z "$to_revert" ] && [ -z "$to_apply" ]; then
+    log "${desc} already in sync. Nothing to do."
+    return 0
+  fi
+
+  local baseline; baseline=$(baseline_version)
+
+  local apply_baseline="" skip_apply="" out_of_order=""
+  local v
+  for v in $to_apply; do
+    if [ "$v" = "$baseline" ]; then apply_baseline="$v"
+    elif [ "$v" \< "$baseline" ]; then out_of_order="${out_of_order}${v}"$'\n'
+    else skip_apply="${skip_apply}${v}"$'\n'; fi
+  done
+
+  [ -n "$apply_baseline" ] && echo "  to mark APPLIED (squash baseline): ${apply_baseline}"
+  [ -n "$to_revert" ]      && echo "  to mark REVERTED: $(echo "$to_revert" | tr '\n' ' ')"
+
+  if [ -n "$out_of_order" ]; then
+    warn "These migration files predate the squash baseline (${baseline}) and have no"
+    more "bookkeeping row - most likely your own branch migrations, rebased under a"
+    more "teammate's squash. Nothing is marked for them; migration order is by"
+    more "filename, so each needs a fresh timestamp NEWER than the baseline:"
+    local oo
+    for oo in $out_of_order; do
+      local oof; oof=$(file_for_version "$oo")
+      [ -n "$oof" ] || continue
+      more "  ${oo}:"
+      rename_hint "$oof"
+    done
+    more "Then apply them with: supabase migration up --local"
+  fi
+
+  if [ -n "$skip_apply" ]; then
+    warn "REFUSING to mark these as applied - they are newer than the baseline (${baseline})"
+    more "and have no bookkeeping row, meaning they have NEVER RUN on the ${desc}:"
+    printf '%s' "$skip_apply" | sed 's/^/      /' >&2
+    if [ "$scope" = "--local" ]; then
+      more "Apply them for real with:  supabase migration up --local"
+    else
+      more "Deploy them through your normal migration deploy path."
+    fi
+    more "(If you are POSITIVE the schema already contains one - e.g. its row was"
+    more "deleted by hand - mark it yourself: supabase migration repair ${scope} --status applied <version>)"
+  fi
+
+  if [ -z "$apply_baseline" ] && [ -z "$to_revert" ]; then
+    log "Nothing safe to reconcile on ${desc}."
+    return 0
+  fi
+
+  if [ "$scope" = "--linked" ]; then
+    confirm "Apply this to the LINKED project's migration history? (bookkeeping-only, but irreversible without a schema_migrations backup)"
+  elif [ -n "$apply_baseline" ] && [ "$verified" != "verified" ]; then
+    warn "Marking the baseline as applied assumes your schema ALREADY contains everything"
+    more "in ${apply_baseline}, and that could not be checked automatically here."
+    more "If you had unapplied migrations when the squash was made, this records a lie"
+    more "and your DB will silently drift (missing columns/tables)."
+    confirm "Was this DB fully migrated before the squash?"
+  fi
+
+  # Rows are the only record of where a DB actually sits, and reverting one
+  # is not undoable from the CLI - keep a restorable copy first.
+  if [ "$scope" = "--local" ] && [ -n "$to_revert" ]; then
+    local receipt; receipt=$(backup_schema_migrations_local) || receipt=""
+    [ -n "$receipt" ] && echo "  bookkeeping receipt: ${receipt}"
+  fi
+
+  for v in $apply_baseline; do
+    echo "  -- ${v} => applied (${desc})"
+    supabase migration repair "$scope" --status applied "$v"
+  done
+  for v in $to_revert; do
+    echo "  -- ${v} => reverted (${desc})"
+    supabase migration repair "$scope" --status reverted "$v"
+  done
+
+  log "Current migration list on ${desc}:"
+  supabase migration list "$scope"
+}
+
+# The guarded entrypoint - what `repair` and `squash` call.
+#
+# For --local it refuses to record anything the SCHEMA doesn't back up. Two
+# states send it down the catch-up path instead of the bookkeeping path:
+#
+#   1. The baseline has no row and the DB holds older rows - it was behind
+#      when the squash landed. The files it is missing are gone from the
+#      tree, so there is nothing for `migration up` to run and marking the
+#      baseline applied would be a lie.
+#   2. Bookkeeping already looks perfectly in sync but the schema is missing
+#      things the baseline declares - the lie is already recorded (someone
+#      answered "yes" to an unverified confirm, or an auto-repair cleared the
+#      rows). This is the case that reports "already in sync" while local and
+#      the linked project look wildly different.
+#
+# --linked keeps the old behaviour: the linked project is baselined by the
+# squash itself, is never behind, and must never be replayed against.
+repair() {
+  local scope="$1"
+  local verified="${2:-}"
+
+  if [ "$scope" != "--local" ] || [ "$verified" = "verified" ]; then
+    reconcile_bookkeeping "$scope" "$verified"
+    return $?
+  fi
+
+  local baseline; baseline=$(baseline_version)
+  [ -n "$baseline" ] || abort "supabase/migrations/ is empty - nothing to reconcile against."
+
+  ensure_local_db_conn
+  local gaps_rc=0
+  report_baseline_gaps_local || gaps_rc=$?
+
+  if [ "$gaps_rc" -eq 1 ]; then
+    # An empty DB isn't behind, it's unborn: the baseline should be RUN, not
+    # faked.
+    if [ -z "$(psql_local_query "select 1 from information_schema.tables where table_schema='public' limit 1;")" ]; then
+      warn "The local database has no public schema at all - this is a fresh DB, not a squash casualty."
+      abort "Apply the baseline for real:  supabase migration up --local"
+    fi
+    warn "This local DB was BEHIND when the squash landed. The migrations it is missing were"
+    more "deleted by that squash, so 'supabase migration up' has nothing left to run, and"
+    more "marking ${baseline} applied would record a lie rather than fix anything."
+    offer_catchup_local "$baseline"
+    return $?
+  fi
+
+  if [ "$gaps_rc" -eq 0 ]; then
+    # The column check passing is NOT a certificate - it cannot see function
+    # bodies, policies, indexes or grants. Ask the real differ before
+    # recording that this DB contains the baseline, because that row is what
+    # everything downstream trusts.
+    echo "  running the deep check (shadow database, ~30s) before certifying"
+    local deep_rc=0
+    deep_verify_local || deep_rc=$?
+
+    if [ "$deep_rc" -eq 1 ] && deep_check_found_missing; then
+      warn "Tables and columns line up, but the local schema is MISSING ${DDB_DEEP_DROPS} object(s)"
+      more "the migration files declare - policies, indexes, functions or grants, none of"
+      more "which the column check can see. Each line names one your database lacks:"
+      deep_diff_missing_text | sed 's/^/      /' | head -20 >&2
+      echo
+      echo "  Refusing to mark ${baseline} applied - that would record a lie and hide this."
+      offer_catchup_local "$baseline"
+      return $?
+    fi
+
+    if [ "$deep_rc" -eq 1 ]; then
+      # Additions only: local holds objects this tree's migrations do not
+      # declare. Routine when several worktrees share one local DB, and it
+      # does not contradict the baseline being present, so it does not block
+      # the repair.
+      echo "  deep check: local carries objects this tree's migrations do not declare"
+      echo "  (normal with several worktrees on one local database)"
+    fi
+
+    if [ "$deep_rc" -ge 2 ]; then
+      warn "Could not run the deep check, so the schema is unverified."
+      more "Recording nothing on a guess - re-run when docker and the CLI are healthy."
+      reconcile_bookkeeping "$scope"
+      return $?
+    fi
+
+    reconcile_bookkeeping "$scope" verified
+    return $?
+  fi
+
+  # gaps_rc == 2: could not read the schema. Fall through unverified - the
+  # mechanical path will ask before recording anything it can't prove.
+  reconcile_bookkeeping "$scope"
+}
+
+# The "this DB is behind" branch, shared by both ways of discovering it: the
+# cheap column gap check and the deep differ. Offers the catch-up replay and
+# leaves the bookkeeping untouched when declined.
+offer_catchup_local() {
+  local baseline="$1"
+  echo
+  echo "  Catch-up replays the missing migrations, recovered from git, in one"
+  echo "  transaction. It is the only operation here that changes your schema - and it"
+  echo "  is NOT 'db reset': your local data stays where it is."
+
+  # If no baseline row has been faked yet, the remaining rows still
+  # truthfully say where this DB sits, and the probe can start there instead
+  # of scanning.
+  local trusted=""
+  if supabase migration list --local >/dev/null 2>&1 && ! psql_local_query "select 1 from supabase_migrations.schema_migrations where version = '${baseline}';" | grep -q 1; then
+    trusted=$(max_applied_local)
+  fi
+
+  if ask "Run catch-up now?"; then
+    catchup_local "$trusted"
+    return $?
+  fi
+  abort "Bookkeeping left untouched - those rows are the only record of where this DB sits. Run '${REPAIR_CMD} --catchup-local' when ready."
+}
+
+# Non-interactive, non-blocking dev-startup variant of the local repair.
+# Designed to be safe to run unconditionally on every dev start:
+#   - Returns immediately if the local supabase stack isn't reachable.
+#   - Returns immediately if there's no drift AND the schema backs up what
+#     the bookkeeping claims.
+#   - Auto-reverts stale rows (DB rows w/o files) ONLY when the baseline
+#     already has a row, i.e. this DB really was current when the squash
+#     landed. When the baseline has NO row, those stale rows are the only
+#     surviving record of where this DB sits, so it leaves them alone and
+#     prints what to run. Clearing them first turns a routine catch-up into
+#     archaeology.
+#   - Never applies anything, and never changes a schema: a squash catch-up
+#     is a real migration run and belongs to a human at a prompt, not to dev
+#     startup.
+#   - Always returns 0 so it can't block dev startup.
+auto_repair_local() {
+  # Probe: is the local supabase stack reachable?
+  if ! supabase migration list --local >/dev/null 2>&1; then
+    return 0
+  fi
+  ensure_local_db_conn
+  local baseline; baseline=$(baseline_version)
+  local drift; drift=$(parse_drift --local || true)
+  local to_apply to_revert
+  to_apply=$(echo "$drift"  | awk '/^L /{print $2}')
+  to_revert=$(echo "$drift" | awk '/^R /{print $2}')
+
+  # A DB that never ran the baseline was behind when the squash landed. There
+  # is nothing safe to do here without a human - not even the stale-row
+  # cleanup.
+  if [ -n "$baseline" ] && echo "$to_apply" | grep -qx "$baseline"; then
+    warn "[auto-repair] This local DB was BEHIND when the current squash landed."
+    echo "    It has no bookkeeping row for the baseline ${baseline}, and the migrations it"
+    echo "    is missing were deleted by that squash - so 'migration up' has nothing to run."
+    echo "    Leaving your ${to_revert:+$(echo "$to_revert" | wc -l | tr -d ' ') }bookkeeping row(s) alone: they record where this DB actually sits."
+    echo
+    echo "    Fix it with:   ${REPAIR_CMD} --local"
+    echo "    (replays the deleted migrations from git, in one transaction - NOT a db reset)"
+    return 0
+  fi
+
+  # Bookkeeping can be in sync and still be a lie - check the schema itself.
+  # Gaps come back as OUTPUT; a non-zero return means "couldn't check", which
+  # on dev startup must stay silent rather than cry wolf.
+  local gaps
+  gaps=$(baseline_schema_gaps 2>/dev/null) || gaps=""
+  if [ -n "$gaps" ]; then
+    warn "[auto-repair] Bookkeeping says ${baseline} is applied, but this schema does not contain it."
+    echo "    Missing, e.g.: $(printf '%s\n' "$gaps" | head -3 | tr '\n' ' ')"
+    echo "    Something recorded a baseline it had not actually run. Your local DB is behind"
+    echo "    the migration files, which is why local and the linked project look different."
+    echo
+    echo "    Fix it with:   ${REPAIR_CMD} --local"
+    echo "    (replays the missing migrations from git, in one transaction - NOT a db reset)"
+    return 0
+  fi
+
+  if [ -n "$to_revert" ]; then
+    local count; count=$(echo "$to_revert" | wc -l | tr -d ' ')
+    log "[auto-repair] Detected a squashed migration history (you likely just pulled a teammate's squash)."
+    echo "    Auto-cleaning ${count} stale bookkeeping row(s) from supabase_migrations.schema_migrations."
+    echo "    Metadata-only - your local schema and data are NOT touched."
+    local receipt; receipt=$(backup_schema_migrations_local) || receipt=""
+    [ -n "$receipt" ] && echo "    receipt (restorable): ${receipt}"
+    local v
+    for v in $to_revert; do
+      echo "  -- ${v} => reverted"
+      supabase migration repair --local --status reverted "$v" >/dev/null 2>&1 || true
+    done
+  fi
+
+  if [ -n "$to_apply" ]; then
+    warn "[auto-repair] local DB has unapplied migration(s):"
+    echo "$to_apply" | sed 's/^/    /'
+    # A pending file OLDER than the baseline cannot be ordered by
+    # `migration up` - it needs a fresh timestamp first.
+    local v oof
+    for v in $to_apply; do
+      if [ -n "$baseline" ] && [ "$v" \< "$baseline" ]; then
+        oof=$(file_for_version "$v")
+        echo "    NOTE: ${v} predates the squash baseline ${baseline}. Rename it past the"
+        echo "    baseline first (fresh timestamp), or 'migration up' cannot order it:"
+        [ -n "$oof" ] && echo "      mv ${oof} supabase/migrations/\$(date +%Y%m%d%H%M%S)_$(basename "$oof" | cut -d_ -f2-)"
+      fi
+    done
+    echo "    To apply: supabase migration up --local"
+    # Unapplied migrations ARE the actionable message. Running the deep check
+    # here would spend 30s to report the same thing in a vaguer way.
+    return 0
+  fi
+
+  auto_deep_verify_local
+  return 0
+}
+
+# The standing net. Everything above this point is either cheap-and-blind
+# (the column gap check) or depends on someone choosing to run a repair.
+# Neither catches a laptop that quietly carries stale function bodies while
+# every cheap check reports "ok". So: run the REAL differ automatically, and
+# re-run it whenever the contents of supabase/migrations/ change - pulling a
+# squash, pulling an ordinary migration, switching branches. In between, the
+# recorded verdict is replayed instantly at no cost. A dirty verdict keeps
+# nagging on every start until it is fixed.
+#
+# Never blocks and never changes anything: it prints and returns 0.
+auto_deep_verify_local() {
+  local fp; fp=$(migrations_fingerprint)
+  [ -n "$fp" ] || return 0
+
+  local stamp="" stamp_fp="" stamp_verdict=""
+  stamp=$(cat "$DDB_SCHEMA_STAMP" 2>/dev/null || true)
+  if [ -n "$stamp" ]; then
+    stamp_fp="${stamp%% *}"
+    stamp_verdict="${stamp##* }"
+  fi
+
+  if [ "$stamp_fp" = "$fp" ]; then
+    case "$stamp_verdict" in
+      clean|extra) return 0 ;;
+    esac
+    warn "[auto-repair] Your local schema is MISSING objects that supabase/migrations/ declares."
+    echo "    Recorded by the last deep check. Tables and columns can all be present"
+    echo "    and the schema still be wrong: stale function bodies, missing policies,"
+    echo "    indexes, grants. That is what this check sees and the cheap one cannot."
+    echo
+    echo "    Fix it with:   ${REPAIR_CMD} --local"
+    echo "    Re-check with: ${VERIFY_CMD}"
+    return 0
+  fi
+
+  log "[auto-repair] supabase/migrations/ changed - verifying your local schema against it."
+  echo "    Builds a shadow database from the migration files and diffs your local DB"
+  echo "    against it (~30s). Runs once per change to supabase/migrations/, not every start."
+  local rc=0
+  local_schema_deep_check || rc=$?
+  case "$rc" in
+    0) echo "    ok: local schema matches the migration files"
+       schema_stamp_write "$fp" clean ;;
+    1) if deep_check_found_missing; then
+         schema_stamp_write "$fp" dirty
+         warn "[auto-repair] Your local schema is MISSING ${DDB_DEEP_DROPS} object(s) that supabase/migrations/ declares."
+         more "Each line below names something the files define and your database lacks:"
+         deep_diff_missing_text | sed 's/^/      /' | head -15 >&2
+         echo
+         echo "    Fix it with:   ${REPAIR_CMD} --local"
+         echo "    (replays the missing migrations from git, in one transaction - NOT a db reset)"
+       else
+         # Local-only extras. Expected when several worktrees share this DB,
+         # so it is recorded and noted, never warned about.
+         schema_stamp_write "$fp" extra
+         echo "    ok: nothing missing. Your DB also carries objects this tree's migrations"
+         echo "    do not declare - normal with several worktrees on one DB."
+       fi ;;
+    *) schema_stamp_clear
+       echo "    (could not run the differ - will retry on the next start)" ;;
+  esac
+  return 0
+}
+
+# =============================================================================
+# The squash flow
+# =============================================================================
+# What it does (in order):
+#   1. Preflight: confirm `supabase link` set, working tree clean under
+#      supabase/migrations/, local DB == linked project's migration history,
+#      AND (1b) that this machine's local schema actually matches
+#      supabase/migrations/ - a drifted laptop looks identical on the history
+#      check, and Step 7 repairs local. On the trunk it cuts
+#      `squash-migrations-<date>` straight off it and switches - no prompt, a
+#      squash always needs its own branch.
+#   2. Snapshot the linked project's `supabase_migrations.schema_migrations`
+#      to /tmp/ (rollback safety - restore this file if anything goes wrong).
+#   3. Extract `auth.users` trigger DDL from the current migration files
+#      (defensive: in case the squash dump ever omits them, we re-append),
+#      plus squash-preserve and squash-append fenced blocks - DDL the
+#      pg_dump-based squash CANNOT emit correctly.
+#   4. `supabase migration squash --linked --yes` -
+#        a) consolidates ALL migration files into the LATEST one (in-place
+#           rewrite; older files are `rm`'d),
+#        b) baselines the LINKED project's schema_migrations to that version
+#           automatically (this is what --yes auto-accepts). The local docker
+#           DB is NOT touched. Then stamp the new baseline with the
+#           `-- dork-db:baseline` marker so repair can identify it.
+#   5. Re-append auth.users triggers, re-PREPEND squash-preserve blocks and
+#      re-APPEND squash-append blocks, only where the new baseline is missing
+#      them.
+#   6. `supabase db diff --linked --schema public` - gate that proves the
+#      baseline faithfully reproduces the linked project. Aborts if
+#      non-empty.
+#   7. Repair LOCAL: mark old versions as reverted (their DB rows are stale).
+#   8. Verify LINKED: usually a no-op (Step 4 already baselined it). Runs as
+#      a safety net in case --yes was skipped or the CLI changes behavior.
+#   9. Commit the baseline, push the branch from Step 1, create the PR (body
+#      = the teammate note, verbatim) and open its link. Skipped on the trunk
+#      or without gh; then the note is printed to paste by hand instead. It
+#      STOPS at the open PR - merging is a human decision, never this
+#      script's.
+#  10. Print next steps.
+#
+# KEY INVARIANT: A squash is METADATA-ONLY. The only DB state that ever
+# changes is `supabase_migrations.schema_migrations`. The `public` schema,
+# RLS, data, and storage are NEVER touched. If you ever catch this script
+# (or yourself) running `supabase db reset` or `supabase db push`, STOP -
+# that is not what this procedure does.
+#
+# ROLLBACK (if the linked baseline goes wrong):
+#   SUPABASE_DB_URL="postgresql://postgres:<pw>@db.<ref>.supabase.co:5432/postgres"
+#   psql "$SUPABASE_DB_URL" \
+#     -c "TRUNCATE supabase_migrations.schema_migrations;" \
+#     -f /tmp/dork_db_linked_schema_migrations_YYYYMMDD_HHMM.sql
+#   git revert <squash-commit>
+#   supabase migration list --linked   # should show all old versions again
+#
+# GOTCHAS:
+#   - `supabase migration list/repair` without a scope flag defaults to
+#     --linked.
+#   - `--schema public` is mandatory in db dump/diff - Supabase-managed
+#     schemas (auth, storage, realtime) own themselves.
+#   - In a git worktree, `supabase link` is not inherited; copy
+#     supabase/.temp/project-ref from the main checkout.
+#   - `supabase migration repair` is idempotent - re-running after a partial
+#     failure is safe.
+
+# The branch the squash PR targets. Config wins; then origin/HEAD; then
+# main/master by existence.
+trunk_branch() {
+  local b="${DORK_DB_PR_BASE:-}"
+  if [ -z "$b" ]; then
+    b=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    b="${b#origin/}"
+  fi
+  if [ -z "$b" ]; then
+    if git show-ref --verify --quiet refs/heads/main; then b=main
+    elif git show-ref --verify --quiet refs/heads/master; then b=master; fi
+  fi
+  printf '%s' "${b:-main}"
+}
+
+build_teammate_note() {
+  local first
+  if [ -n "$DEV_AUTOREPAIR" ]; then
+    first="After pulling this branch, just run \`${DEV_CMD}\` - dev startup runs
+\`${REPAIR_CMD} --auto-local\`, which cleans your local schema_migrations table
+(metadata-only; your schema and data are NOT touched)."
+  else
+    first="After pulling this branch, run \`${REPAIR_CMD} --local\` once. It is
+metadata-only: your schema and data are NOT touched."
+  fi
+  cat <<NOTE
+${first} DO NOT run \`supabase db reset\` or \`supabase db push\`.
+
+Because supabase/migrations/ changed, the repair also diffs your local database
+against the migration files through a shadow database (~30s, once for this
+change) and tells you if they disagree. That check sees function bodies,
+policies, indexes and grants - the things a table/column comparison misses. If
+it reports a difference, run \`${REPAIR_CMD} --local\`: it recovers the deleted
+migrations from git and replays them in one transaction. Still not a reset -
+your local data stays.
+
+Same story if your local DB was BEHIND when this squash was made: the repair
+says so and stops rather than clean anything, because the migrations you are
+missing were deleted by the squash and \`migration up\` has nothing left to run.
+NOTE
+}
+
+cmd_squash() {
+  [ $# -eq 0 ] || abort "Usage: ${SELF} squash   (no arguments - runs the full squash flow). For repairs, see '${SELF} repair'."
+
+  # ---------- Step 1: preflight ----------
+  log "Step 1: preflight"
+  [ -f supabase/.temp/project-ref ] || abort "Supabase project not linked. Run 'supabase link' first. (In a git worktree, copy supabase/.temp/project-ref from the main checkout.)"
+
+  if [ -n "$(git status --porcelain supabase/migrations/ 2>/dev/null)" ]; then
+    abort "supabase/migrations/ has uncommitted changes. Commit or stash first."
+  fi
+
+  # Capture drift OUTSIDE the [ ] condition so a parse_drift failure (jq
+  # missing, CLI output format change) aborts via set -e instead of reading
+  # as "no drift".
+  local LOCAL_DRIFT LINKED_DRIFT
+  LOCAL_DRIFT=$(parse_drift --local)
+  LINKED_DRIFT=$(parse_drift --linked)
+  if [ -n "$LOCAL_DRIFT" ] || [ -n "$LINKED_DRIFT" ]; then
+    log "Local migration list:";  supabase migration list --local
+    log "Linked migration list:"; supabase migration list --linked
+    abort "Local and the linked project are not fully in sync with the migrations/ directory. Fix that first."
+  fi
+  echo "  ok: linked, clean tree, local == linked"
+
+  # That check compares migration HISTORY, not schema - and history in sync
+  # is exactly how a drifted laptop looks. The squash itself is safe either
+  # way (it dumps the linked schema, and Step 6 gates the baseline against
+  # it), but Step 7 repairs LOCAL, and repairing a laptop whose schema does
+  # not match the files is how a lie gets recorded. Confirm the schema too,
+  # before touching anything.
+  log "Step 1b: verifying the local schema against supabase/migrations/"
+  local PREFLIGHT_DEEP_RC=0
+  deep_verify_local || PREFLIGHT_DEEP_RC=$?
+  if [ "$PREFLIGHT_DEEP_RC" -eq 1 ] && deep_check_found_missing; then
+    warn "This machine's local schema is MISSING ${DDB_DEEP_DROPS} object(s) the migration files declare."
+    more "Each line names something the files define and this database lacks:"
+    deep_diff_missing_text | sed 's/^/      /' | head -20 >&2
+    more "Squashing from here would repair local bookkeeping onto a schema that is"
+    more "already wrong. Fix it first:  ${REPAIR_CMD} --local"
+    abort "Aborted before anything was touched."
+  elif [ "$PREFLIGHT_DEEP_RC" -eq 1 ]; then
+    echo "  note: local carries objects this tree's migrations do not declare (other"
+    echo "  worktrees share this DB). Nothing is missing, so the squash may proceed."
+  elif [ "$PREFLIGHT_DEEP_RC" -ge 2 ]; then
+    warn "Could not verify the local schema (docker or CLI trouble)."
+    confirm "Continue the squash anyway?"
+  fi
+
+  local TRUNK CURR_BRANCH BASE_BRANCH
+  TRUNK=$(trunk_branch)
+  CURR_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  BASE_BRANCH="$CURR_BRANCH"
+  if [ "$CURR_BRANCH" = "$TRUNK" ] || [ "$CURR_BRANCH" = "main" ] || [ "$CURR_BRANCH" = "master" ]; then
+    # A squash rewrites every migration file and needs its own PR, so cut the
+    # branch here instead of making the caller remember. Any unrelated
+    # uncommitted work comes along with `checkout -b` (migrations/ is already
+    # verified clean above).
+    local BRANCH="squash-migrations-$(date +%Y-%m-%d)"
+    if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+      local N=2
+      while git show-ref --verify --quiet "refs/heads/${BRANCH}-${N}"; do N=$((N + 1)); done
+      BRANCH="${BRANCH}-${N}"   # earlier attempt today already owns the plain name
+    fi
+    # Cut it, don't ask. A squash always needs its own branch and the answer
+    # is never "no" - prompting here just adds a keystroke to a flow that
+    # already verified migrations/ is clean.
+    git checkout -b "$BRANCH"
+    CURR_BRANCH="$BRANCH"
+    echo "  ok: cut ${CURR_BRANCH} from ${BASE_BRANCH}"
+  fi
+
+  # ---------- Step 2: snapshot linked metadata (rollback safety) ----------
+  local SNAPSHOT="/tmp/dork_db_linked_schema_migrations_$(date +%Y%m%d_%H%M).sql"
+  log "Step 2: snapshotting the linked project's schema_migrations to ${SNAPSHOT}"
+  supabase db dump --linked --data-only --schema supabase_migrations -f "$SNAPSHOT"
+
+  # ---------- Step 3: extract auth.users triggers from current files ----------
+  local TRIGGERS; TRIGGERS=$(mktemp)
+  log "Step 3: extracting auth.users trigger DDL from current migration files"
+  # Single-line CREATE [OR REPLACE] TRIGGER ... ON "auth"."users" ... ; - the
+  # common convention. A multi-line trigger DDL would need this extended.
+  grep -hE '^CREATE.*TRIGGER.*ON "?auth"?\."?users"?.*;[[:space:]]*$' supabase/migrations/*.sql \
+    | sort -u > "$TRIGGERS" || true
+
+  if [ -s "$TRIGGERS" ]; then
+    echo "  found:"
+    sed 's/^/    /' "$TRIGGERS"
+  else
+    echo "  none found"
+  fi
+
+  # ---------- Step 3b: extract squash-preserve blocks ----------
+  # The squash dump is a pg_dump of the `public` schema, so it drops anything
+  # cluster-level that the schema depends on - a CREATE ROLE most of all (the
+  # GRANTs to that role DO survive, and then fail to apply because the role
+  # no longer exists). Fence such DDL between the squash-preserve markers and
+  # it is re-PREPENDED to the next baseline. Prepended, not appended: the
+  # dump body below it is what depends on the object existing.
+  local PRESERVED; PRESERVED=$(mktemp)
+  log "Step 3b: extracting squash-preserve blocks from current migration files"
+  awk '/^-- >>> squash-preserve/ { keep = 1 }
+       keep             { print }
+       /^-- <<< squash-preserve/ { keep = 0; print "" }' \
+    supabase/migrations/*.sql > "$PRESERVED" || true
+
+  if [ -s "$PRESERVED" ]; then
+    echo "  found:"
+    grep '^-- >>> squash-preserve' "$PRESERVED" | sed 's/^/    /'
+  else
+    echo "  none found"
+  fi
+
+  # ---------- Step 3c: extract squash-append blocks ----------
+  # The mirror of 3b, for DDL that must run AFTER the dump body rather than
+  # before it. The case that forced this: a REVOKE. pg_dump emits a
+  # relation's RESULTING ACL, never the REVOKE that produced it, so a
+  # privilege removed on the linked project silently comes back on every
+  # fresh database the moment the relation is created.
+  local APPENDED_BLOCKS; APPENDED_BLOCKS=$(mktemp)
+  log "Step 3c: extracting squash-append blocks from current migration files"
+  awk '/^-- >>> squash-append/ { keep = 1 }
+       keep             { print }
+       /^-- <<< squash-append/ { keep = 0; print "" }' \
+    supabase/migrations/*.sql > "$APPENDED_BLOCKS" || true
+
+  if [ -s "$APPENDED_BLOCKS" ]; then
+    echo "  found:"
+    grep '^-- >>> squash-append' "$APPENDED_BLOCKS" | sed 's/^/    /'
+  else
+    echo "  none found"
+  fi
+
+  # ---------- Step 4: run the squash ----------
+  log "Step 4: running 'supabase migration squash --linked --yes'"
+  echo "  Consolidates all migration files into the latest one (in-place rewrite)"
+  echo "  and baselines the linked project's schema_migrations to the same version."
+  echo "  --yes skips the CLI's interactive 'Update remote migration history table?'"
+  echo "  prompt since we've already confirmed."
+  confirm "Continue? (touches both files AND the linked project's bookkeeping)"
+  supabase migration squash --linked --yes
+
+  # Identify the new baseline. `supabase migration squash` consolidates into
+  # the LATEST existing migration file (rewriting it in place) rather than
+  # creating a new file - so detect via `ls` rather than `git status ??`.
+  local NEW_BASELINE
+  NEW_BASELINE=$(ls supabase/migrations/*.sql 2>/dev/null | sort | tail -1)
+  [ -z "$NEW_BASELINE" ] && abort "supabase/migrations/ is empty after squash."
+  [ -f "$NEW_BASELINE" ] || abort "Detected baseline path '$NEW_BASELINE' does not exist."
+  log "New baseline: $NEW_BASELINE"
+
+  # ---------- Step 4b: stamp the baseline marker ----------
+  # This is how repair identifies the baseline without assuming "oldest
+  # file" - an assumption broken by any branch migration whose timestamp
+  # predates the squash.
+  if ! grep -q '^-- dork-db:baseline' "$NEW_BASELINE"; then
+    local STAMPED; STAMPED=$(mktemp)
+    {
+      printf -- '-- dork-db:baseline (squashed %s by %s squash)\n' "$(date +%Y-%m-%d)" "$SELF"
+      cat "$NEW_BASELINE"
+    } > "$STAMPED"
+    mv "$STAMPED" "$NEW_BASELINE"
+    echo "  stamped: -- dork-db:baseline"
+  fi
+
+  # ---------- Step 5: append auth.users triggers (only if missing) ----------
+  # Empirically `supabase migration squash --linked` already includes
+  # auth.users triggers in the dump, but if it ever changes behavior we want
+  # a safety net.
+  if [ -s "$TRIGGERS" ]; then
+    if grep -qE 'ON "?auth"?\."?users"?' "$NEW_BASELINE"; then
+      log "Step 5: auth.users triggers already in baseline (squash included them). Skipping append."
+    else
+      log "Step 5: appending auth.users triggers to ${NEW_BASELINE}"
+      {
+        printf '\n-- auth.users triggers (appended by %s squash - squash dump did not include them)\n' "$SELF"
+        cat "$TRIGGERS"
+      } >> "$NEW_BASELINE"
+    fi
+  else
+    log "Step 5: skipped (no auth.users triggers to append)"
+  fi
+
+  # ---------- Step 5b: re-prepend squash-preserve blocks (only if missing) ----------
+  if [ -s "$PRESERVED" ]; then
+    if grep -q '^-- >>> squash-preserve' "$NEW_BASELINE"; then
+      log "Step 5b: squash-preserve blocks already in baseline. Skipping prepend."
+    else
+      log "Step 5b: re-prepending squash-preserve blocks to ${NEW_BASELINE}"
+      local PREPENDED; PREPENDED=$(mktemp)
+      cat "$PRESERVED" "$NEW_BASELINE" > "$PREPENDED"
+      mv "$PREPENDED" "$NEW_BASELINE"
+      grep '^-- >>> squash-preserve' "$NEW_BASELINE" | sed 's/^/    /'
+    fi
+  else
+    log "Step 5b: skipped (no squash-preserve blocks)"
+  fi
+
+  # ---------- Step 5c: re-append squash-append blocks (only if missing) ----------
+  if [ -s "$APPENDED_BLOCKS" ]; then
+    if grep -q '^-- >>> squash-append' "$NEW_BASELINE"; then
+      log "Step 5c: squash-append blocks already in baseline. Skipping append."
+    else
+      log "Step 5c: re-appending squash-append blocks to ${NEW_BASELINE}"
+      cat "$APPENDED_BLOCKS" >> "$NEW_BASELINE"
+      grep '^-- >>> squash-append' "$NEW_BASELINE" | sed 's/^/    /'
+    fi
+  else
+    log "Step 5c: skipped (no squash-append blocks)"
+  fi
+
+  # ---------- Step 6: db diff gate ----------
+  log "Step 6: validating baseline against the linked project (db diff --linked --schema public)"
+  local DIFF_OUT
+  DIFF_OUT=$(supabase db diff --linked --schema public 2>&1 || true)
+  if echo "$DIFF_OUT" | grep -q "No schema changes found"; then
+    echo "  ok: db diff is clean"
+  else
+    printf '\n%s\n\n' "$DIFF_OUT"
+    warn "db diff is NOT clean - baseline does not faithfully reproduce the linked project."
+    warn "Fix ${NEW_BASELINE} by hand, then re-run 'supabase db diff --linked --schema public'."
+    warn "When clean, run '${REPAIR_CMD} --local' then '${REPAIR_CMD} --prod' to finish."
+    exit 1
+  fi
+
+  # ---------- Step 7: repair LOCAL first ----------
+  log "Step 7: repairing LOCAL"
+  repair --local
+
+  # ---------- Step 8: repair LINKED ----------
+  log "Step 8: repairing LINKED"
+  repair --linked
+
+  # ---------- Step 9: commit, push, open the PR ----------
+  # The squash is only useful to the team once it is on a branch they can
+  # pull, and the teammate note IS the reason the PR exists - so do both here
+  # instead of leaving them as copy-paste steps. Everything above this line
+  # already succeeded (diff gate clean, local + linked repaired), so this is
+  # bookkeeping.
+  local COMMIT_MSG="Squash migrations into $(basename "${NEW_BASELINE}" .sql)"
+  local PR_URL=""
+  local TEAMMATE_NOTE; TEAMMATE_NOTE=$(build_teammate_note)
+
+  log "Step 9: commit + PR"
+  if [ "$CURR_BRANCH" = "$TRUNK" ] || [ "$CURR_BRANCH" = "main" ] || [ "$CURR_BRANCH" = "master" ]; then
+    # Unreachable in practice - Step 1 always cuts the branch. Kept as a
+    # backstop so a future edit there can never leak a commit onto the trunk.
+    warn "Still on ${CURR_BRANCH} - not committing or pushing."
+    more "A squash rewrites every migration file; it needs its own branch and PR."
+  elif ! command -v gh >/dev/null 2>&1; then
+    warn "gh CLI not found - skipping the PR. Commit and open it by hand (see below)."
+  else
+    # No prompt: committing, pushing and opening the PR is the point of the
+    # flow, and everything above already succeeded. The PR is where it STOPS
+    # - merging is a human decision, never this script's and never an
+    # agent's.
+    if [ -z "$(git status --porcelain supabase/migrations/)" ]; then
+      echo "  nothing to commit under supabase/migrations/ (already committed?)"
+    else
+      # -A so the deleted migration files are staged too; the pathspec on
+      # commit keeps any unrelated staged work out of this commit.
+      git add -A supabase/migrations/
+      git commit -q -m "$COMMIT_MSG" -- supabase/migrations
+      echo "  committed: ${COMMIT_MSG}"
+    fi
+
+    if ! git push -q -u origin "$CURR_BRANCH"; then
+      warn "Push failed - the squash itself is fine. Push and open the PR by hand (see below)."
+    else
+      echo "  pushed: ${CURR_BRANCH}"
+      PR_URL=$(gh pr view "$CURR_BRANCH" --json url -q .url 2>/dev/null || true)
+      if [ -n "$PR_URL" ]; then
+        echo "  PR already open: ${PR_URL}"
+        open_url "$PR_URL"
+      else
+        local PR_BODY; PR_BODY=$(mktemp)
+        {
+          printf 'Consolidates every migration file into `%s`.\n\n' "$(basename "$NEW_BASELINE")"
+          printf 'Metadata-only: `%s squash` reconciled `supabase_migrations.schema_migrations` on local and the linked project, and gated the baseline on a clean `supabase db diff --linked --schema public`. The `public` schema, RLS, data and storage are untouched.\n\n' "$SELF"
+          printf '## After you pull this\n\n%s\n\n' "$TEAMMATE_NOTE"
+          if [ -n "$POST_SQUASH_CHECKS" ]; then
+            printf '## Verify nothing actually changed\n\n```\n%s\n```\n\n' "$POST_SQUASH_CHECKS"
+          fi
+          printf '<sub>Rollback snapshot of the linked bookkeeping: `%s` (on the machine that ran the squash).</sub>\n' "$SNAPSHOT"
+        } > "$PR_BODY"
+        PR_URL=$(gh pr create --base "$TRUNK" --head "$CURR_BRANCH" --title "$COMMIT_MSG" --body-file "$PR_BODY")
+        rm -f "$PR_BODY"
+        echo "  opened: ${PR_URL}"
+        open_url "$PR_URL"
+      fi
+    fi
+  fi
+
+  # ---------- Step 10: next steps ----------
+  cat <<EOF
+
+================================================================================
+ Squash complete on local + linked.
+ Rollback snapshot: ${SNAPSHOT}
+EOF
+
+  if [ -n "$PR_URL" ]; then
+    cat <<EOF
+ PR: ${PR_URL}
+================================================================================
+
+Next steps:
+
+  1. Verify nothing actually changed:
+EOF
+    if [ -n "$POST_SQUASH_CHECKS" ]; then
+      printf '%s\n' "$POST_SQUASH_CHECKS" | sed 's/^/       /'
+    else
+      echo "       (regenerate any DB types, run your tests, smoke-test the app)"
+    fi
+    cat <<EOF
+
+  2. Post the PR link in the team channel before merging.
+
+EOF
+  else
+    cat <<EOF
+================================================================================
+
+Next steps (manual - no PR was opened):
+
+  1. Commit the new baseline + deletions (skip if Step 9 already committed):
+       git add -A supabase/migrations/
+       git commit -m "${COMMIT_MSG}"
+
+  2. Verify nothing actually changed:
+EOF
+    if [ -n "$POST_SQUASH_CHECKS" ]; then
+      printf '%s\n' "$POST_SQUASH_CHECKS" | sed 's/^/       /'
+    else
+      echo "       (regenerate any DB types, run your tests, smoke-test the app)"
+    fi
+    cat <<EOF
+
+  3. Open a PR. Paste this teammate note verbatim into the body:
+
+$(printf '%s\n' "$TEAMMATE_NOTE" | sed 's/^./       &/')
+
+  4. Post the PR link in the team channel before merging.
+
+EOF
+  fi
+}
+
+# =============================================================================
+# Repair dispatch
+# =============================================================================
+
+repair_banner() {
+  cat <<'BANNER'
+
+  ───────────────────────────────────────────────────────────────────────────
+   REPAIR MODE - this reconciles the migration bookkeeping table
+   (supabase_migrations.schema_migrations). It does NOT run db reset or db push,
+   and does NOT touch your data or storage.
+   It is safe to run repeatedly; nothing you have built locally can be lost.
+   Only the squash BASELINE can be marked applied, and only after the schema has
+   been checked to actually contain it; migrations newer than the baseline that
+   never ran here are refused (apply those with migration up).
+   If this DB turns out to be BEHIND a squash, you'll be offered a catch-up:
+   the deleted migrations, recovered from git and replayed in one transaction.
+  ───────────────────────────────────────────────────────────────────────────
+BANNER
+}
+
+catchup_banner() {
+  cat <<'BANNER'
+
+  ───────────────────────────────────────────────────────────────────────────
+   CATCH-UP MODE - for a LOCAL DB that was behind when a squash landed.
+   The migrations it is missing no longer exist as files, so they are recovered
+   from git history and replayed in ONE transaction (all-or-nothing).
+   This is NOT `db reset`: your local rows, storage objects and auth users stay.
+   Nothing is written until you have seen the exact list and confirmed it.
+  ───────────────────────────────────────────────────────────────────────────
+BANNER
+}
+
+repair_usage() {
+  cat >&2 <<USAGE
+Usage: ${SELF} repair (--local | --catchup-local | --verify-local | --prod | --auto-local)
+
+  --local          Reconcile the LOCAL docker DB's migration bookkeeping, after
+                   checking that its schema backs up what the bookkeeping claims.
+                   Run this after pulling a teammate's squash IF your dev startup
+                   did not handle it for you. If this DB turns out to have been
+                   behind when the squash landed, it offers the catch-up below.
+  --catchup-local  Replay the migrations a squash deleted, recovered from git, in
+                   one transaction. The only mode that changes a schema - still
+                   never a \`db reset\`, and never touches the linked project.
+  --verify-local   Read-only. Diff the local DB against supabase/migrations/ via a
+                   shadow database, and record the verdict. Sees function bodies,
+                   policies, indexes and grants, which the table/column check
+                   cannot.
+  --prod           Reconcile the LINKED project's migration bookkeeping
+                   (recovery; rare). Alias: --linked.
+  --auto-local     Dev-startup hook: auto-reverts provably stale rows, never
+                   applies or replays, exits 0. Wire it into your dev command.
+
+To CREATE a squash (consolidate migration files), use '${SELF} squash'.
+USAGE
+  exit 2
+}
+
+cmd_repair() {
+  local MODE="${1:-}"
+  case "$MODE" in
+    --local|local)                  MODE=--local ;;
+    --prod|prod|--linked|linked)    MODE=--linked ;;   # --linked is the supabase scope name; accept as alias
+    --auto-local|auto-local)        MODE=--auto-local ;;
+    --catchup-local|catchup-local|--catchup|catchup) MODE=--catchup-local ;;
+    --verify-local|verify-local|--verify|verify)     MODE=--verify-local ;;
+    *) repair_usage ;;
+  esac
+
+  case "$MODE" in
+    --local)
+      repair_banner
+      repair --local
+      ;;
+    --catchup-local)
+      catchup_banner
+      catchup_local
+      ;;
+    --linked)
+      repair_banner
+      repair --linked
+      ;;
+    --auto-local)
+      auto_repair_local
+      ;;
+    --verify-local)
+      # Read-only: builds a shadow DB from supabase/migrations/, diffs the
+      # local DB against it, and records the verdict so dev startup can
+      # replay it for free. Changes nothing, on either database.
+      log "Verifying the local schema against supabase/migrations/ (~30s)"
+      local rc=0
+      deep_verify_local || rc=$?
+      case "$rc" in
+        0) exit 0 ;;
+        1) if deep_check_found_missing; then
+             warn "The local schema is MISSING ${DDB_DEEP_DROPS} object(s) the migration files declare."
+             more "Each line names something the files define and your database lacks:"
+             deep_diff_missing_text | sed 's/^/      /' | head -30 >&2
+             more "Fix it with: ${REPAIR_CMD} --local"
+             exit 1
+           fi
+           log "Nothing missing. Your DB also carries objects this tree's migrations do not"
+           echo "  declare - normal when several worktrees share one database:"
+           deep_diff_text | head -20
+           exit 0 ;;
+        *) abort "Could not run the differ. Is the local stack up ('${DEV_CMD}') and docker healthy?" ;;
+      esac
+      ;;
+  esac
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+usage() {
+  cat <<EOF
+Usage: ${SELF} <command>
+
+  squash       Consolidate every Supabase migration file into one baseline and
+               reconcile local + linked bookkeeping (metadata-only; branch,
+               commit and PR included). Run from a repo linked with
+               'supabase link'.
+  repair ...   Reconcile / verify / catch up a database against
+               supabase/migrations/. Run '${SELF} repair' for its modes.
+  help         This text.
+
+Project config (optional) lives in .dork.sh at the repo root - see the header
+of this file for the DORK_DB_* variables.
+
+THE INVARIANT: squash and repair only ever change the bookkeeping table
+supabase_migrations.schema_migrations. Nothing here runs 'supabase db reset'
+or 'supabase db push', on any scope, ever. The one schema-changing operation
+is the LOCAL catch-up replay (real historical migrations, one transaction,
+local docker DB only - and still not a reset: local data stays).
+EOF
+}
+
+command -v git >/dev/null 2>&1 || abort "git is required."
+[ -d supabase ] || abort "No supabase/ directory under ${REPO_ROOT} - is this a Supabase project?"
+
+case "${1:-}" in
+  squash)         shift
+                  command -v supabase >/dev/null 2>&1 || abort "The supabase CLI is required."
+                  command -v jq >/dev/null 2>&1 || abort "jq is required."
+                  cmd_squash "$@" ;;
+  repair)         shift
+                  command -v supabase >/dev/null 2>&1 || abort "The supabase CLI is required."
+                  cmd_repair "$@" ;;
+  # A capability probe for wrapper scripts: exits 0 iff this dork ships db.
+  --check)        exit 0 ;;
+  help|--help|-h) usage ;;
+  *)              usage; exit 2 ;;
+esac

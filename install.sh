@@ -35,6 +35,7 @@ else
 fi
 
 chmod +x "$DORK_HOME/bin/dork"
+if [[ -f "$DORK_HOME/bin/dork-db" ]]; then chmod +x "$DORK_HOME/bin/dork-db"; fi
 
 # Pick a bin dir: ~/.local/bin (created if needed), else the first writable
 # dir already on PATH.
