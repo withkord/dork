@@ -132,6 +132,20 @@ open_url() {
   fi
 }
 
+# Receipts and rollback snapshots hold real data - bookkeeping rows, and in one
+# case a full pg_dump of the local DB - and /tmp is shared. So each one gets a
+# private 0700 directory of its own rather than a fixed path: mktemp -d picks a
+# name no other local user can pre-plant as a symlink, and the mode keeps the
+# contents out of their reach. A plain /tmp/dork_db_<timestamp>.sql was open to
+# both. Nothing here is cleaned up on exit - the whole point of these files is
+# that they outlive the run that wrote them.
+receipt_path() {
+  local dir
+  dir=$(mktemp -d /tmp/dork_db.XXXXXX) || return 1
+  chmod 700 "$dir" || return 1
+  printf '%s/%s' "$dir" "$1"
+}
+
 # =============================================================================
 # Repo root + project config
 # =============================================================================
@@ -394,7 +408,7 @@ rename_hint() {
 # working out afterwards WHICH rows a DB used to have is archaeology. Prints
 # the receipt path; silent + non-zero if it can't.
 backup_schema_migrations_local() {
-  local out="/tmp/dork_db_schema_migrations_$(date +%Y%m%d_%H%M%S).sql"
+  local out; out=$(receipt_path "schema_migrations_$(date +%Y%m%d_%H%M%S).sql") || return 1
   local rows
   rows=$(psql_local_query "select 'insert into supabase_migrations.schema_migrations(version) values (''' || version || ''') on conflict do nothing;' from supabase_migrations.schema_migrations order by version;")
   [ -n "$rows" ] || return 1
@@ -757,7 +771,7 @@ explain_enum_txn_error() {
 # migration that applies cleanly can still drop a column you cared about
 # locally.
 backup_local_db() {
-  local out="/tmp/dork_db_local_db_$(date +%Y%m%d_%H%M%S).sql"
+  local out; out=$(receipt_path "local_db_$(date +%Y%m%d_%H%M%S).sql") || return 1
   if docker exec "$(local_db_container)" pg_dump -U postgres -d postgres > "$out" 2>/dev/null && [ -s "$out" ]; then
     printf '%s' "$out"; return 0
   fi
@@ -1493,7 +1507,7 @@ auto_deep_verify_local() {
 #   SUPABASE_DB_URL="postgresql://postgres:<pw>@db.<ref>.supabase.co:5432/postgres"
 #   psql "$SUPABASE_DB_URL" \
 #     -c "TRUNCATE supabase_migrations.schema_migrations;" \
-#     -f /tmp/dork_db_linked_schema_migrations_YYYYMMDD_HHMM.sql
+#     -f /tmp/dork_db.XXXXXX/linked_schema_migrations_YYYYMMDD_HHMM.sql
 #   git revert <squash-commit>
 #   supabase migration list --linked   # should show all old versions again
 #
@@ -1621,7 +1635,9 @@ cmd_squash() {
   fi
 
   # ---------- Step 2: snapshot linked metadata (rollback safety) ----------
-  local SNAPSHOT="/tmp/dork_db_linked_schema_migrations_$(date +%Y%m%d_%H%M).sql"
+  local SNAPSHOT
+  SNAPSHOT=$(receipt_path "linked_schema_migrations_$(date +%Y%m%d_%H%M).sql") \
+    || abort "Could not create a private snapshot directory under /tmp - refusing to squash without rollback safety."
   log "Step 2: snapshotting the linked project's schema_migrations to ${SNAPSHOT}"
   supabase db dump --linked --data-only --schema supabase_migrations -f "$SNAPSHOT"
 
