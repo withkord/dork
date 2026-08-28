@@ -192,6 +192,13 @@ one schema-changing operation is the **local** catch-up replay (real
 historical migrations, single transaction, local docker DB only), and even
 that is not a reset: local data stays.
 
+**Which local database:** `dork db` resolves the local Postgres from
+`supabase status` and, when the stack is down, from `[db] port` in
+`supabase/config.toml` — never from a fixed port. It then refuses a port that
+another project's `supabase_db_*` container is serving, so a repair or
+catch-up run in one project can never read, or replay into, a neighbour's
+database.
+
 Migration-file markers `dork db` understands (all optional):
 
 ```sql

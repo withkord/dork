@@ -65,6 +65,12 @@
 #                                      smoke-test the app.
 #   DORK_DB_PR_BASE=""                 PR base branch for the squash PR.
 #                                      Default: origin/HEAD, then main/master.
+#   DORK_DB_ACL_RESET=1                Squash inserts an ACL reset ahead of the
+#                                      new baseline's GRANT block (Step 4c) so
+#                                      a REVOKE survives the squash. 0 disables.
+#   DORK_DB_ACL_RESET_ROLES="anon,authenticated,service_role"
+#                                      Roles the reset revokes from: the ones
+#                                      your ALTER DEFAULT PRIVILEGES grant to.
 #
 # MIGRATION-FILE MARKERS this tool reads and writes:
 #   -- dork-db:baseline
@@ -78,9 +84,17 @@
 #       role does not exist).
 #   -- >>> squash-append: <what>  ...  -- <<< squash-append
 #       Idempotent DDL re-APPENDED to every new baseline, after the objects
-#       it references. The forcing case: a REVOKE. pg_dump emits a relation's
-#       RESULTING ACL, never the REVOKE that produced it, so a removed
-#       privilege silently returns on every fresh database.
+#       it references. The original forcing case was a REVOKE: pg_dump emits
+#       a relation's RESULTING ACL, never the REVOKE that produced it, so a
+#       removed privilege silently returned on every fresh database. Step 4c
+#       (the ACL reset) now covers that for every public relation and
+#       routine; the fence remains for DDL a dump cannot express at all.
+#   -- >>> dork-db:acl-reset  ...  -- <<< dork-db:acl-reset
+#       Written into the new baseline by `squash` (Step 4c), right before the
+#       dump's GRANT block: revokes everything from the default-privilege
+#       roles on every non-extension public relation and routine, so the
+#       explicit GRANTs that follow rebuild each ACL exactly as the linked
+#       project holds it.
 #   -- dork-db:drops <table>.<column> <table>.* ...
 #       Declares drops performed from inside DO blocks / dynamic SQL, which
 #       the drop-parser cannot see. Only read from migrations NEWER than the
@@ -134,6 +148,8 @@ REPAIR_CMD="${DORK_DB_REPAIR_CMD:-$SELF repair}"
 VERIFY_CMD="${DORK_DB_VERIFY_CMD:-$REPAIR_CMD --verify-local}"
 DROPS_TAGS="dork-db ${DORK_DB_DROPS_TAGS:-}"
 POST_SQUASH_CHECKS="${DORK_DB_POST_SQUASH_CHECKS:-}"
+ACL_RESET="${DORK_DB_ACL_RESET:-1}"
+ACL_RESET_ROLES="${DORK_DB_ACL_RESET_ROLES:-anon,authenticated,service_role}"
 
 # =============================================================================
 # Local Postgres access
@@ -149,22 +165,64 @@ POST_SQUASH_CHECKS="${DORK_DB_POST_SQUASH_CHECKS:-}"
 DDB_LOCAL_DB_URL=""
 DDB_LOCAL_DB_CONTAINER=""
 
+# Host port of THIS project's local Postgres: `[db] port` in
+# supabase/config.toml. Empty when the key is absent (the CLI then falls back
+# to its own default, 54322).
+config_db_port() {
+  awk '
+    /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s); next }
+    s == "db" && /^[[:space:]]*port[[:space:]]*=/ {
+      v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[^0-9].*$/, "", v); print v; exit
+    }
+  ' supabase/config.toml 2>/dev/null
+}
+
+# Refuse a DB URL whose port is published by ANOTHER project's supabase_db_*
+# container. Each project on a laptop runs its own stack on its own ports, and
+# a URL that lands on a neighbour's database passes every reachability check
+# while the schema it reads - and the catch-up it then replays - belong to the
+# wrong project. No docker on PATH = nothing to check against.
+assert_local_db_is_ours() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local port owner
+  port=$(printf '%s' "$1" | sed -n 's#.*:\([0-9][0-9]*\)/[^/]*$#\1#p')
+  [ -n "$port" ] || return 0
+  owner=$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null \
+    | awk -v p=":${port}->5432" '$1 ~ /^supabase_db_/ && index($0, p) { print $1; exit }') || owner=""
+  [ -z "$owner" ] || [ "$owner" = "$DDB_LOCAL_DB_CONTAINER" ] && return 0
+  local hint="'${DEV_CMD}'"; [ "$DEV_CMD" = "supabase start" ] || hint="${hint} or 'supabase start'"
+  abort "Port ${port} is served by ${owner}, not by this project's ${DDB_LOCAL_DB_CONTAINER}. Refusing to touch another project's database - is this project's stack running (${hint})?"
+}
+
 # Resolve connection details ONCE into globals. Call this from a top-level
 # function before any pipeline that uses psql_local: `supabase status` costs a
 # full second, psql_local runs on the right-hand side of pipelines (a
 # subshell), and a cache written in a subshell evaporates - which silently
 # turns the catch-up probe into a one-second-per-trial crawl.
 ensure_local_db_conn() {
-  if [ -z "$DDB_LOCAL_DB_URL" ]; then
-    # `supabase status` prints a JSON blob (plus non-JSON chatter on stderr).
-    DDB_LOCAL_DB_URL=$(supabase status 2>/dev/null | sed -n '/^{/,$p' | jq -r '.DB_URL // empty' 2>/dev/null || true)
-    [ -n "$DDB_LOCAL_DB_URL" ] || DDB_LOCAL_DB_URL="postgresql://postgres:postgres@127.0.0.1:54322/postgres"
-  fi
+  [ -f supabase/config.toml ] || abort "No supabase/config.toml in ${REPO_ROOT} - not a Supabase project."
   if [ -z "$DDB_LOCAL_DB_CONTAINER" ]; then
     local id
-    id=$(sed -n 's/^project_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' supabase/config.toml 2>/dev/null | head -1)
+    id=$(sed -n 's/^project_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' supabase/config.toml 2>/dev/null | head -1 || true)
     [ -n "$id" ] || id=$(basename "$PWD")
     DDB_LOCAL_DB_CONTAINER="supabase_db_${id}"
+  fi
+  if [ -z "$DDB_LOCAL_DB_URL" ]; then
+    # `supabase status` reads supabase/config.toml, so its DB_URL is this
+    # project's. With the stack down it prints an error blob WITHOUT DB_URL -
+    # then derive the port from config.toml. Never a fixed port: a guessed
+    # 54322 is the CLI's default project port, and with that project's stack
+    # up and this one's down, everything downstream (the schema read, the
+    # "this DB is behind" verdict, the catch-up replay) ran silently against
+    # the neighbour's database.
+    local url port
+    url=$(supabase status -o json 2>/dev/null | sed -n '/^{/,$p' | jq -r '.DB_URL // empty' 2>/dev/null || true)
+    if [ -z "$url" ]; then
+      port=$(config_db_port); [ -n "$port" ] || port=54322
+      url="postgresql://postgres:postgres@127.0.0.1:${port}/postgres"
+    fi
+    assert_local_db_is_ours "$url"
+    DDB_LOCAL_DB_URL="$url"
   fi
 }
 
@@ -191,6 +249,100 @@ local_db_reachable() { printf 'select 1;\n' | psql_local -Atq >/dev/null 2>&1; }
 # =============================================================================
 
 migration_files()   { ls supabase/migrations/*.sql 2>/dev/null | sort; }
+
+# =============================================================================
+# ACL reset (squash Step 4c)
+# =============================================================================
+# pg_dump emits each relation's RESULTING ACL as GRANT lines and never the
+# REVOKE that produced it. On replay - a fresh local stack, the db diff shadow
+# DB - Supabase's ALTER DEFAULT PRIVILEGES hands ALL on every new public
+# relation to anon / authenticated / service_role the moment its CREATE runs,
+# and nothing in the dump takes it back: a migration whose net effect was
+# "fewer privileges than the default" is silently undone by the squash, and
+# only the db diff gate ever notices. So the squash starts every ACL from zero
+# right before the GRANT block; the explicit GRANTs pg_dump already emits then
+# rebuild each ACL exactly as the linked project holds it. Extension members
+# are skipped: pg_dump emits no ACL for them, so a revoke there would BE drift.
+ACL_RESET_MARK="-- >>> dork-db:acl-reset"
+
+acl_reset_sql() {
+  cat <<SQL
+${ACL_RESET_MARK}: start every public ACL from zero before the GRANT block
+-- pg_dump emits each relation's RESULTING ACL as GRANTs and never the REVOKE
+-- that produced it, while the default privileges hand ALL on every new public
+-- relation to ${ACL_RESET_ROLES} the moment its CREATE runs. Revoking here lets
+-- the GRANTs below rebuild every ACL exactly as the linked project holds it.
+-- Extension members are skipped (pg_dump emits no ACL for those).
+-- Inserted by ${SELF} squash; DORK_DB_ACL_RESET=0 in .dork.sh disables it.
+DO \$\$
+DECLARE
+  r record;
+  roles text;
+BEGIN
+  SELECT string_agg(quote_ident(rolname), ', ') INTO roles
+  FROM pg_roles
+  WHERE rolname IN (SELECT btrim(x) FROM unnest(string_to_array('${ACL_RESET_ROLES}', ',')) AS x);
+  IF roles IS NULL THEN RETURN; END IF;
+  FOR r IN
+    SELECT c.oid::regclass AS rel, c.relkind
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+      AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')
+  LOOP
+    EXECUTE format('REVOKE ALL ON %s %s FROM %s',
+                   CASE WHEN r.relkind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, r.rel, roles);
+  END LOOP;
+  FOR r IN
+    SELECT p.oid::regprocedure AS fn
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e')
+  LOOP
+    EXECUTE format('REVOKE ALL ON ROUTINE %s FROM %s', r.fn, roles);
+  END LOOP;
+END
+\$\$;
+-- <<< dork-db:acl-reset
+SQL
+}
+
+# Insert the reset into a freshly squashed baseline, once, right before its
+# first GRANT/REVOKE line. Refuses (and says so) when the dump creates a
+# relation or routine AFTER that line - a revoke there would wipe grants the
+# dump had already made, and fenced REVOKEs plus the gate still cover that.
+acl_reset_insert() {
+  local file="$1"
+  if [ "$ACL_RESET" != "1" ]; then
+    log "Step 4c: ACL reset disabled (DORK_DB_ACL_RESET=${ACL_RESET}). Skipping."
+    return 0
+  fi
+  if grep -q "^${ACL_RESET_MARK}" "$file"; then
+    log "Step 4c: ACL reset already in baseline. Skipping."
+    return 0
+  fi
+  local first_acl last_create
+  first_acl=$(grep -nE '^(GRANT|REVOKE) ' "$file" | head -1 | cut -d: -f1 || true)
+  last_create=$(grep -niE '^CREATE (OR REPLACE )?(UNLOGGED |FOREIGN |MATERIALIZED )?(TABLE|VIEW|SEQUENCE|FUNCTION|PROCEDURE|AGGREGATE)[[:space:](]' "$file" | tail -1 | cut -d: -f1 || true)
+  if [ -z "$first_acl" ]; then
+    log "Step 4c: the dump has no GRANT/REVOKE block - nothing to reset ahead of. Skipping."
+    return 0
+  fi
+  if [ -n "$last_create" ] && [ "$last_create" -gt "$first_acl" ]; then
+    warn "Step 4c: the dump creates a relation or routine AFTER its first GRANT (line ${last_create} > ${first_acl})."
+    more "Not inserting the ACL reset - a revoke there would wipe grants the dump already made."
+    more "REVOKEs stay fenced (squash-append) for this baseline; the Step 6 gate still checks ACLs."
+    return 0
+  fi
+  local tmp; tmp=$(mktemp)
+  { head -n $((first_acl - 1)) "$file"; acl_reset_sql; echo; tail -n +"$first_acl" "$file"; } > "$tmp"
+  mv "$tmp" "$file"
+  log "Step 4c: inserted the ACL reset ahead of the GRANT block (before line ${first_acl})"
+  echo "  revokes from: ${ACL_RESET_ROLES}"
+}
 version_of()        { basename "$1" | cut -d_ -f1; }
 
 # The BASELINE is the file a squash consolidated everything into - the only
@@ -1308,7 +1460,13 @@ auto_deep_verify_local() {
 #        b) baselines the LINKED project's schema_migrations to that version
 #           automatically (this is what --yes auto-accepts). The local docker
 #           DB is NOT touched. Then stamp the new baseline with the
-#           `-- dork-db:baseline` marker so repair can identify it.
+#           `-- dork-db:baseline` marker so repair can identify it,
+#        c) insert the ACL reset right before the dump's GRANT block: a
+#           REVOKE from anon / authenticated / service_role on every public
+#           relation and routine, so the explicit GRANTs the dump already
+#           carries rebuild each ACL exactly and a REVOKE survives the squash
+#           (pg_dump never emits one; Supabase's default privileges would
+#           otherwise re-grant ALL on replay).
 #   5. Re-append auth.users triggers, re-PREPEND squash-preserve blocks and
 #      re-APPEND squash-append blocks, only where the new baseline is missing
 #      them.
@@ -1554,6 +1712,13 @@ cmd_squash() {
     mv "$STAMPED" "$NEW_BASELINE"
     echo "  stamped: -- dork-db:baseline"
   fi
+
+  # ---------- Step 4c: ACL reset ahead of the dump's GRANT block ----------
+  # See acl_reset_sql above. Must run BEFORE 5b/5c: the reset belongs inside
+  # the dump body, after every CREATE and before the first GRANT; prepended
+  # squash-preserve DDL stays ahead of it and appended squash-append DDL
+  # stays behind it.
+  acl_reset_insert "$NEW_BASELINE"
 
   # ---------- Step 5: append auth.users triggers (only if missing) ----------
   # Empirically `supabase migration squash --linked` already includes
