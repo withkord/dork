@@ -171,7 +171,8 @@ docker (for the local stack); `gh` makes squash open the PR for you.
   really matches the files (via a shadow-database diff), snapshots the linked
   project's bookkeeping to /tmp for rollback, runs
   `supabase migration squash --linked`, re-attaches DDL a pg_dump can't emit
-  (see the fences below), gates the result on a clean
+  (see the fences below), inserts an ACL reset ahead of the dump's GRANT
+  block so a `REVOKE` survives the squash, gates the result on a clean
   `supabase db diff --linked --schema public`, then commits on its own branch
   and opens the PR.
 - **`dork db repair --local`** — everyone else runs this after pulling (or
@@ -206,9 +207,17 @@ Migration-file markers `dork db` understands (all optional):
 create role ...;                          -- (cluster-level DDL pg_dump drops)
 -- <<< squash-preserve
 
--- >>> squash-append: keep this REVOKE    ← re-APPENDED after the dump body
-revoke ...;                               -- (pg_dump emits ACLs, not REVOKEs)
+-- >>> squash-append: keep this trigger  ← re-APPENDED after the dump body
+create trigger ...;                       -- (DDL a dump cannot express)
 -- <<< squash-append
+
+-- >>> dork-db:acl-reset                  ← written by squash, not by you:
+DO $$ ... revoke all ... $$;              --   revokes anon/authenticated/
+-- <<< dork-db:acl-reset                  --   service_role on every public
+                                          --   relation + routine right before
+                                          --   the dump's GRANT block, so the
+                                          --   GRANTs rebuild each ACL exactly
+                                          --   and a REVOKE survives the squash
 
 -- dork-db:drops old_table.* other.col    ← declare drops done in DO blocks /
                                           --   dynamic SQL the parser can't see
@@ -220,7 +229,10 @@ stack, for messages), `DORK_DB_DEV_AUTOREPAIR=1` (set when dev startup runs
 repo spells those commands, e.g. wrapper scripts or npm aliases),
 `DORK_DB_DROPS_TAGS` (extra `-- <tag>:drops` marker tags),
 `DORK_DB_POST_SQUASH_CHECKS` (multi-line project checks printed after a
-squash and put in the PR body), `DORK_DB_PR_BASE` (squash PR base branch).
+squash and put in the PR body), `DORK_DB_PR_BASE` (squash PR base branch), `DORK_DB_ACL_RESET=0` (skip the
+ACL reset), `DORK_DB_ACL_RESET_ROLES` (roles it revokes from; default
+`anon,authenticated,service_role` - the ones Supabase's default privileges
+grant to).
 
 ## Notes & limitations
 
