@@ -1,6 +1,6 @@
 {
   "name": "@withkord/dork",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Parallel git worktrees for agentic coding, plus team-safe Supabase migration squash & repair (dork db)",
   "license": "MIT",
   "repository": {

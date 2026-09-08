@@ -278,6 +278,23 @@ ACL reset), `DORK_DB_ACL_RESET_ROLES` (roles it revokes from; default
 `anon,authenticated,service_role` - the ones Supabase's default privileges
 grant to).
 
+## Upgrading to 0.5
+
+Worktrees moved from `.claude/worktrees/` to `.dork/worktrees/` — they were never
+Claude-specific, and dork supports other agents. `.claude/` still holds the guard
+hook and permissions, which really are Claude Code's.
+
+If you have live worktrees from an older version, finish and `dork kill` them
+before upgrading. Already upgraded and they've gone missing from `dork kill` /
+`dork sync` / `dork pr`? Point dork back at the old directory in `.dork.sh`:
+
+```bash
+DORK_WORKTREE_DIR="$REPO_ROOT/.claude/worktrees"
+```
+
+Then drop that line once they're cleared. Re-run `dork init` afterwards to get
+the new `.gitignore` entry.
+
 ## Notes & limitations
 
 - Worktrees live under `.dork/worktrees/<port>` inside the repo (gitignored);
