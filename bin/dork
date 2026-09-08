@@ -125,7 +125,7 @@ require_repo() {
     source "$REPO_ROOT/.dork.sh"
   fi
 
-  WORKTREE_DIR="${DORK_WORKTREE_DIR:-$REPO_ROOT/.claude/worktrees}"
+  WORKTREE_DIR="${DORK_WORKTREE_DIR:-$REPO_ROOT/.dork/worktrees}"
   BASE_PORT="${DORK_BASE_PORT:-3001}"
   MAX_PORT="${DORK_MAX_PORT:-3008}"
   MAIN_BRANCH="$(resolve_main_branch)"
@@ -1322,7 +1322,7 @@ cmd_init() {
 
 # Trunk branch (default: auto-detected), worktree location, terminal backend.
 #DORK_MAIN_BRANCH=main
-#DORK_WORKTREE_DIR="$REPO_ROOT/.claude/worktrees"
+#DORK_WORKTREE_DIR="$REPO_ROOT/.dork/worktrees"
 #DORK_TERMINAL=tmux   # ghostty | tmux | none (default: auto-detect)
 EOF
     echo "[dork] Wrote .dork.sh (edit to taste)"
@@ -1332,7 +1332,7 @@ EOF
   # 2. gitignore entries
   local gi="$REPO_ROOT/.gitignore" added=""
   touch "$gi"
-  local wt_rel=".claude/worktrees/"
+  local wt_rel=".dork/worktrees/"
   if [[ -n "${DORK_WORKTREE_DIR:-}" ]]; then
     wt_rel="${DORK_WORKTREE_DIR#"$REPO_ROOT"/}/"
   fi
@@ -1354,7 +1354,7 @@ EOF
     if ! cmp -s "$DORK_HOME/hooks/block-main-repo-edits.py" "$REPO_ROOT/.claude/hooks/block-main-repo-edits.py" 2>/dev/null; then
       cp "$DORK_HOME/hooks/block-main-repo-edits.py" "$REPO_ROOT/.claude/hooks/block-main-repo-edits.py"
       chmod +x "$REPO_ROOT/.claude/hooks/block-main-repo-edits.py"
-      echo "[dork] Installed .claude/hooks/block-main-repo-edits.py"
+      echo "[dork] Installed .claude/hooks/block-main-repo-edits.py (Claude Code only)"
       wrote=1
     fi
     if command -v python3 >/dev/null 2>&1; then
@@ -1394,7 +1394,7 @@ PYEOF
   # 4. Starter Claude Code permission set (opt-in)
   if [[ "$perms" == "ask" ]]; then
     if [[ -t 0 && -t 1 ]]; then
-      printf '[dork] Add the starter Claude Code permission set to .claude/settings.json?\n'
+      printf '[dork] Add the starter permission set to .claude/settings.json? (Claude Code only)\n'
       printf '       (allow: common dev commands without prompts; deny: destructive git —\n'
       printf '        denies keep applying even in yolo mode) [y/N] '
       local answer=""

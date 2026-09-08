@@ -162,7 +162,7 @@ DORK_DEV_CMD='PORT={port} pnpm dev'
 
 # Trunk branch (auto-detected), worktree dir, terminal backend.
 #DORK_MAIN_BRANCH=main
-#DORK_WORKTREE_DIR="$REPO_ROOT/.claude/worktrees"
+#DORK_WORKTREE_DIR="$REPO_ROOT/.dork/worktrees"
 #DORK_TERMINAL=tmux   # ghostty | tmux | none (auto-detected)
 ```
 
@@ -199,11 +199,10 @@ DORK_YOLO_CMD_GEMINI='gemini --yolo'
 
 (Variable suffix = the agent name uppercased, non-alphanumerics as `_`.)
 
-Two caveats when you switch away from Claude Code: the worktree guard hook and
+One caveat when you switch away from Claude Code: the worktree guard hook and
 the starter permission set that `dork init` writes are Claude Code features —
 other agents ignore them, so in `dork yolo` you're relying on that agent's own
-sandbox. And `.claude/worktrees/` stays the default worktree directory
-(`DORK_WORKTREE_DIR` moves it).
+sandbox.
 
 ## Supabase migrations (`dork db`)
 
@@ -281,7 +280,7 @@ grant to).
 
 ## Notes & limitations
 
-- Worktrees live under `.claude/worktrees/<port>` inside the repo (gitignored);
+- Worktrees live under `.dork/worktrees/<port>` inside the repo (gitignored);
   the port doubles as the worktree/branch id.
 - Pane tiling drives Ghostty via AppleScript (macOS) or tmux (anywhere). In
   any other terminal, `dork new` still creates the worktree and starts the
