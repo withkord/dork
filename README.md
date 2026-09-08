@@ -3,7 +3,8 @@
 Parallel git worktrees for agentic coding.
 
 `dork yolo 4` gives you four isolated worktrees — each with its own branch, port,
-dev server, and coding agent (Claude Code by default) — tiled in your terminal.
+dev server, and coding agent (Claude Code by default, Codex with
+`dork yolo codex 4`) — tiled in your terminal.
 When PRs merge, `dork sync all` rebases every worktree onto the fresh trunk.
 Linear history, no merge commits, no branch babysitting.
 
@@ -28,7 +29,8 @@ Update any time with `dork update` (it detects how dork was installed).
 
 **Requirements:** git ≥ 2.31 and bash. Optional but recommended: [`gh`](https://cli.github.com)
 (for `dork pr` and merge detection), [Claude Code](https://claude.com/claude-code)
-(the default agent), and [Ghostty](https://ghostty.org) on macOS **or** tmux anywhere
+(the default agent) or [Codex](https://developers.openai.com/codex/cli)
+(`dork new codex`), and [Ghostty](https://ghostty.org) on macOS **or** tmux anywhere
 (for pane tiling — without either, dork still manages worktrees, it just doesn't split panes).
 
 ## Set up a repo (once per project, committed)
@@ -106,8 +108,8 @@ worktree: resolve there, `git rebase --continue`, re-run sync.
 
 | Command | What it does |
 |---|---|
-| `dork new [N]` | New worktree(s) + deps + dev server + agent. N tiles the terminal (Ghostty: 2 or 4, tmux: 2–8). |
-| `dork yolo [N]` | Same, but the agent runs with `--dangerously-skip-permissions`. |
+| `dork new [agent] [N]` | New worktree(s) + deps + dev server + agent. N tiles the terminal (Ghostty: 2 or 4, tmux: 2–8). |
+| `dork yolo [agent] [N]` | Same, but the agent skips its permission prompts (`claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`). |
 | `dork sync [all\|P …]` | Rebase worktree branch(es) onto the latest trunk (see above). |
 | `dork pr [title]` | Commit pending changes, push, open a GitHub PR, open its page. |
 | `dork kill [P …]` | Stop dev server(s), remove worktree(s), delete branch(es). |
@@ -147,9 +149,16 @@ DORK_DEV_CMD='PORT={port} pnpm dev'
 #  echo "APP_URL=http://localhost:$2" >> "$1/.env.local"
 #}
 
-# Agent launched in each worktree (default: Claude Code).
+# Coding agent launched in each worktree (default: claude; see "Agents").
+#DORK_AGENT=codex
+
+# How an agent is launched. The un-suffixed pair applies to the default
+# agent; the _<AGENT> pair applies to that agent only — and is how you teach
+# dork an agent it doesn't know.
 #DORK_AGENT_CMD='claude'
 #DORK_YOLO_CMD='claude --dangerously-skip-permissions'
+#DORK_AGENT_CMD_CODEX='codex'
+#DORK_YOLO_CMD_CODEX='codex --dangerously-bypass-approvals-and-sandbox'
 
 # Trunk branch (auto-detected), worktree dir, terminal backend.
 #DORK_MAIN_BRANCH=main
@@ -158,7 +167,43 @@ DORK_DEV_CMD='PORT={port} pnpm dev'
 ```
 
 Per-user (not committed): `git config --global dork.branch-prefix yourname`,
-`git config dork.main-branch <branch>` (per repo, overrides detection).
+`git config dork.main-branch <branch>` (per repo, overrides detection),
+`git config --global dork.agent codex` (your default agent, overrides
+`DORK_AGENT` in `.dork.sh`).
+
+## Agents
+
+dork launches Claude Code by default and knows Codex out of the box. Name the
+agent on the command line — bare or as a flag, before or after the pane count:
+
+```sh
+dork new codex          # one worktree, codex in the pane
+dork yolo codex 4       # four worktrees, codex with approvals+sandbox off
+dork yolo --codex       # same thing, flag form
+dork new                # claude (the default)
+```
+
+Change the default without typing it every time — personally with
+`git config --global dork.agent codex`, or for the whole project with
+`DORK_AGENT=codex` in `.dork.sh` (the git config wins).
+
+Any other agent works too: an unknown name that's on your `PATH` is simply run
+under that name (`dork new gemini` → `gemini`). Since dork can't guess another
+agent's skip-the-prompts flag, `dork yolo <that agent>` asks you to spell it
+out once in `.dork.sh`:
+
+```sh
+DORK_AGENT_CMD_GEMINI='gemini'
+DORK_YOLO_CMD_GEMINI='gemini --yolo'
+```
+
+(Variable suffix = the agent name uppercased, non-alphanumerics as `_`.)
+
+Two caveats when you switch away from Claude Code: the worktree guard hook and
+the starter permission set that `dork init` writes are Claude Code features —
+other agents ignore them, so in `dork yolo` you're relying on that agent's own
+sandbox. And `.claude/worktrees/` stays the default worktree directory
+(`DORK_WORKTREE_DIR` moves it).
 
 ## Supabase migrations (`dork db`)
 
@@ -241,6 +286,8 @@ grant to).
 - Pane tiling drives Ghostty via AppleScript (macOS) or tmux (anywhere). In
   any other terminal, `dork new` still creates the worktree and starts the
   agent — it just prints the dev-server command instead of splitting.
+- The worktree guard hook and starter permissions are Claude Code-specific;
+  other agents (`dork new codex`) run without them.
 - `dork pr` and squash-merge detection need `gh` authenticated for your repo's
   host. Without `gh`, sync still fast-forwards and rebases; it just can't
   detect merged PRs.

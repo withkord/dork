@@ -3,12 +3,15 @@
 # dork — parallel git worktrees for agentic coding.
 #
 # Each worktree gets its own branch, port, dev server, and coding agent
-# (Claude Code by default), tiled in your terminal (Ghostty or tmux).
+# (Claude Code by default, or any agent you name — e.g. codex), tiled in your
+# terminal (Ghostty or tmux).
 # A linear-history PR flow keeps every worktree in step with the trunk.
 #
-#   dork new [N]    — new worktree; dev server pane + shell pane + agent here;
+#   dork new [agent] [N]
+#                   — new worktree; dev server pane + shell pane + agent here;
 #                     with N: create N worktrees tiled in the terminal
-#   dork yolo [N]   — same as new, but the agent skips permission prompts
+#   dork yolo [agent] [N]
+#                   — same as new, but the agent skips permission prompts
 #   dork sync [all|P …] — rebase branch(es) onto the latest trunk (see FLOW)
 #   dork pr [title] — commit pending changes, push, open a PR (gh pr create)
 #   dork kill [P …] — kill worktree(s) + branch(es); no args: current worktree
@@ -46,11 +49,17 @@ usage() {
   cat <<EOF
 Usage: $PROG <command>
 
-  new [N]      Worktree + deps; dev server pane, shell pane, agent in this one.
+  new [agent] [N]
+               Worktree + deps; dev server pane, shell pane, agent in this one.
                With N: create N worktrees tiled in the terminal (Ghostty: 2 or
-               4; tmux: 2-8).
-  yolo [N]     Same as new, but the agent skips permission prompts
-               (claude --dangerously-skip-permissions).
+               4; tmux: 2-8). [agent] picks the coding agent — built in:
+               $DORK_KNOWN_AGENTS (default: $(resolve_agent_name)) — bare or as
+               a flag, in either order with N: '$PROG new codex 4',
+               '$PROG new --codex'.
+  yolo [agent] [N]
+               Same as new, but the agent skips permission prompts
+               (claude --dangerously-skip-permissions,
+               codex --dangerously-bypass-approvals-and-sandbox).
   sync [all|P …]
                Pull the trunk, then rebase branch(es) onto it: fast-forward
                when possible, reset after a squash-merged PR, otherwise
@@ -240,25 +249,113 @@ setup_env_files() {
   return 0
 }
 
-# The agent launched in each worktree pane. Override via .dork.sh.
+# --- Agents ------------------------------------------------------------------
+
+# Coding agents dork knows how to launch. Pick one per invocation
+# ('$PROG new codex', '$PROG yolo --codex'), or set a default with
+# DORK_AGENT in .dork.sh / `git config dork.agent <name>`. Any other agent
+# can be taught to dork with DORK_AGENT_CMD_<NAME> / DORK_YOLO_CMD_<NAME>
+# (name uppercased, non-alphanumerics as '_'), e.g. DORK_YOLO_CMD_GEMINI.
+DORK_KNOWN_AGENTS="claude codex"
+
+builtin_agent_cmd() {
+  case "$1" in
+    claude) echo "claude" ;;
+    codex)  echo "codex" ;;
+    *)      echo "" ;;
+  esac
+}
+
+# Same, with the agent's own "skip the permission prompts" flag.
+builtin_yolo_cmd() {
+  case "$1" in
+    claude) echo "claude --dangerously-skip-permissions" ;;
+    codex)  echo "codex --dangerously-bypass-approvals-and-sandbox" ;;
+    *)      echo "" ;;
+  esac
+}
+
+# Agent name -> the suffix of its override variables: uppercase, every
+# non-alphanumeric as '_' (printf, so no trailing newline gets translated).
+agent_var_suffix() {
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_'
+}
+
+# The agent for this run: the name given on the command line, else the
+# personal default (git config dork.agent), else the project default
+# (DORK_AGENT in .dork.sh), else Claude Code. Lowercased, and validated —
+# the name is interpolated into AppleScript/tmux command lines below.
+resolve_agent_name() {
+  local a="${1:-}"
+  if [[ -z "$a" ]]; then
+    a="$(git -C "${REPO_ROOT:-.}" config --get dork.agent 2>/dev/null || true)"
+  fi
+  [[ -z "$a" ]] && a="${DORK_AGENT:-}"
+  [[ -z "$a" ]] && a="claude"
+  a="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')"
+  if [[ ! "$a" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+    echo >&2 "[dork] Invalid agent name: '$a' (letters, digits, . _ - only)"
+    exit 1
+  fi
+  echo "$a"
+}
+
+# The command launched in each worktree pane, echoed (empty = dork has no
+# command for this agent). Per-agent overrides win; the un-suffixed
+# DORK_AGENT_CMD / DORK_YOLO_CMD still apply, but only to the default agent,
+# so they keep doing exactly what they did before agents were selectable.
 agent_command() {
-  local yolo="${1:-}"
+  local agent="$1" yolo="${2:-}" var cmd suffix
+  suffix="$(agent_var_suffix "$agent")"
   if [[ -n "$yolo" ]]; then
-    echo "${DORK_YOLO_CMD:-claude --dangerously-skip-permissions}"
+    var="DORK_YOLO_CMD_$suffix"; cmd="${!var:-}"
+    [[ -z "$cmd" && "$agent" == "$(resolve_agent_name)" ]] && cmd="${DORK_YOLO_CMD:-}"
+    [[ -z "$cmd" ]] && cmd="$(builtin_yolo_cmd "$agent")"
   else
-    echo "${DORK_AGENT_CMD:-claude}"
+    var="DORK_AGENT_CMD_$suffix"; cmd="${!var:-}"
+    [[ -z "$cmd" && "$agent" == "$(resolve_agent_name)" ]] && cmd="${DORK_AGENT_CMD:-}"
+    [[ -z "$cmd" ]] && cmd="$(builtin_agent_cmd "$agent")"
+    # An unknown agent that is on PATH just runs under its own name.
+    [[ -z "$cmd" ]] && command -v "$agent" >/dev/null 2>&1 && cmd="$agent"
+  fi
+  echo "$cmd"
+}
+
+# Refuse an agent dork can't launch *before* any worktree is created, so a
+# typo costs nothing. A missing binary is only a warning: the pane says so
+# and drops into a shell in the worktree (exec_agent).
+require_agent() {
+  local agent="$1" yolo="${2:-}" cmd first suffix
+  cmd="$(agent_command "$agent" "$yolo")"
+  if [[ -z "$cmd" ]]; then
+    suffix="$(agent_var_suffix "$agent")"
+    if [[ -n "$yolo" ]]; then
+      echo >&2 "[dork] No permission-skipping command known for agent '$agent'."
+      echo >&2 "[dork] Built in: $DORK_KNOWN_AGENTS. For anything else, add to .dork.sh:"
+      echo >&2 "         DORK_YOLO_CMD_$suffix='$agent <its-skip-prompts-flag>'"
+    else
+      echo >&2 "[dork] Unknown agent '$agent' and no '$agent' on PATH."
+      echo >&2 "[dork] Built in: $DORK_KNOWN_AGENTS. For anything else, add to .dork.sh:"
+      echo >&2 "         DORK_AGENT_CMD_$suffix='$agent <args>'"
+    fi
+    exit 1
+  fi
+  first="${cmd%% *}"
+  if ! command -v "$first" >/dev/null 2>&1; then
+    echo >&2 "[dork] Warning: '$first' is not on your PATH — panes will drop into a shell."
   fi
 }
 
 exec_agent() {
-  local wt_path="$1" yolo="${2:-}" cmd
-  cmd="$(agent_command "$yolo")"
+  local wt_path="$1" agent="$2" yolo="${3:-}" cmd
+  cmd="$(agent_command "$agent" "$yolo")"
   cd "$wt_path"
   local first="${cmd%% *}"
-  if ! command -v "$first" >/dev/null 2>&1; then
-    echo >&2 "[dork] '$first' not found — dropping into a shell in $wt_path"
+  if [[ -z "$cmd" ]] || ! command -v "$first" >/dev/null 2>&1; then
+    echo >&2 "[dork] '${first:-$agent}' not found — dropping into a shell in $wt_path"
     exec "${SHELL:-bash}"
   fi
+  echo >&2 "[dork] Starting $agent: $cmd"
   exec bash -c "$cmd"
 }
 
@@ -448,8 +545,8 @@ $(ghostty_select_term_script "$target_term_id")
 }
 
 ghostty_tile() {
-  local yolo="$1" count="$2"
-  shift 2
+  local agent="$1" yolo="$2" count="$3"
+  shift 3
   local -a ports=("$@")
 
   if [[ "$count" != "2" && "$count" != "4" ]]; then
@@ -462,15 +559,15 @@ ghostty_tile() {
 
   echo >&2 "[dork] Tiling Ghostty into $count panes (ports: ${ports[*]})"
 
-  # The new panes invoke `dork _init-port <port> <term_id> [yolo]`, which
-  # creates the worktree for that specific port, splits its own pane into
-  # dev+shell, and then execs the agent. Splitting before any creation means
-  # all N installs run concurrently across panes. Each spawned pane gets its
-  # own Ghostty term id because by the time _init-port runs, focus has likely
-  # moved to the last-created split.
+  # The new panes invoke `dork _init-port <port> <term_id> <yolo|-> <agent>`,
+  # which creates the worktree for that specific port, splits its own pane
+  # into dev+shell, and then execs the agent. Splitting before any creation
+  # means all N installs run concurrently across panes. Each spawned pane gets
+  # its own Ghostty term id because by the time _init-port runs, focus has
+  # likely moved to the last-created split.
   local init="cd $REPO_ROOT && $DORK_BIN _init-port"
-  local init_suffix=""
-  [[ -n "$yolo" ]] && init_suffix=" yolo"
+  local init_suffix
+  init_suffix="$(init_port_suffix "$agent" "$yolo")"
 
   if [[ "$count" == "2" ]]; then
     osascript -e "
@@ -508,7 +605,7 @@ $(ghostty_select_term_script "$origin_term_id")
   wt_path="$(create_worktree "${ports[0]}")" || exit 1
   echo >&2 "[dork] Splitting Ghostty"
   ghostty_split_dev_and_shell "$origin_term_id" "$wt_path" "$(dev_command_for "${ports[0]}")"
-  exec_agent "$wt_path" "$yolo"
+  exec_agent "$wt_path" "$agent" "$yolo"
 }
 
 # - tmux -
@@ -524,8 +621,8 @@ tmux_split_dev_and_shell() {
 }
 
 tmux_tile() {
-  local yolo="$1" count="$2"
-  shift 2
+  local agent="$1" yolo="$2" count="$3"
+  shift 3
   local -a ports=("$@")
 
   if (( count < 2 || count > 8 )); then
@@ -535,10 +632,9 @@ tmux_tile() {
 
   echo >&2 "[dork] Tiling tmux into $count panes (ports: ${ports[*]})"
 
-  local orig i pane
+  local orig i pane init_suffix
   orig="$(tmux display-message -p '#{pane_id}')"
-  local init_suffix=""
-  [[ -n "$yolo" ]] && init_suffix=" yolo"
+  init_suffix="$(init_port_suffix "$agent" "$yolo")"
 
   for (( i=1; i<count; i++ )); do
     pane="$(tmux split-window -t "$orig" -c "$REPO_ROOT" -P -F '#{pane_id}')"
@@ -550,14 +646,63 @@ tmux_tile() {
   local wt_path
   wt_path="$(create_worktree "${ports[0]}")" || exit 1
   tmux_split_dev_and_shell "$wt_path" "$(dev_command_for "${ports[0]}")"
-  exec_agent "$wt_path" "$yolo"
+  exec_agent "$wt_path" "$agent" "$yolo"
 }
 
 # --- new / yolo / tile -------------------------------------------------------
 
+# `new` and `yolo` take an optional agent name and an optional pane count, in
+# either order, bare or as a flag — all of these work:
+#   dork yolo            dork yolo 4          dork yolo codex
+#   dork yolo codex 4    dork yolo 4 codex    dork yolo --codex 4
+#   dork yolo --agent codex 4
+# Echoes the agent name on the first line, the pane count on the second
+# (either may be empty).
+parse_new_args() {
+  local agent="" count="" arg
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    shift
+    case "$arg" in
+      "")            ;;
+      --agent|-a)    [[ $# -ge 1 ]] || { echo >&2 "[dork] --agent needs an agent name"; exit 1; }
+                     agent="$1"; shift ;;
+      --agent=*)     agent="${arg#--agent=}" ;;
+      --*)           agent="${arg#--}" ;;
+      *[!0-9]*)      agent="$arg" ;;
+      *)             count="$arg" ;;
+    esac
+  done
+  printf '%s\n%s\n' "$agent" "$count"
+}
+
+# Entry point for both `new` and `yolo`: resolve the agent, then hand off to
+# the single-pane or the tiling path.
+cmd_new_or_tile() {
+  local yolo="$1"
+  shift
+  # usage() writes to stdout, so it can't run inside the parse subshell below.
+  local arg
+  for arg in "$@"; do
+    case "$arg" in -h|--help) usage ;; esac
+  done
+
+  local parsed agent count
+  parsed="$(parse_new_args "$@")"
+  agent="$(printf '%s' "$parsed" | sed -n 1p)"
+  count="$(printf '%s' "$parsed" | sed -n 2p)"
+  agent="$(resolve_agent_name "$agent")"
+  require_agent "$agent" "$yolo"
+
+  if [[ -n "$count" ]]; then
+    cmd_tile "$agent" "$yolo" "$count"
+  else
+    cmd_new "$agent" "$yolo"
+  fi
+}
+
 cmd_new() {
-  local yolo=""
-  [[ "${1:-}" == yolo ]] && yolo="yolo"
+  local agent="$1" yolo="${2:-}"
 
   local terminal
   terminal="$(detect_terminal)"
@@ -586,29 +731,26 @@ cmd_new() {
       ;;
   esac
 
-  exec_agent "$wt_path" "$yolo"
+  exec_agent "$wt_path" "$agent" "$yolo"
 }
 
 # Multi-pane mode for `new N` / `yolo N`: reserve N ports, tile the terminal,
-# and run one worktree + agent per pane. First arg is optionally `yolo`.
+# and run one worktree + agent per pane.
 cmd_tile() {
-  local yolo=""
-  if [[ "${1:-}" == yolo ]]; then
-    yolo="yolo"
-    shift
-  fi
-  local count="${1:?[dork] tile requires a pane count}"
+  local agent="$1" yolo="$2"
+  local count="${3:?[dork] tile requires a pane count}"
 
   if ! [[ "$count" =~ ^[0-9]+$ ]]; then
     echo >&2 "[dork] Pane count must be a number (got: $count)"
     exit 1
   fi
 
-  local terminal
+  local terminal sub_cmd="new"
+  [[ -n "$yolo" ]] && sub_cmd="yolo"
   terminal="$(detect_terminal)"
   if [[ "$terminal" == "none" ]]; then
-    echo >&2 "[dork] '$PROG new $count' needs Ghostty (macOS) or tmux for pane tiling."
-    echo >&2 "[dork] Run '$PROG new' per terminal instead, or start a tmux session first."
+    echo >&2 "[dork] '$PROG $sub_cmd $count' needs Ghostty (macOS) or tmux for pane tiling."
+    echo >&2 "[dork] Run '$PROG $sub_cmd $agent' per terminal instead, or start a tmux session first."
     exit 1
   fi
 
@@ -625,21 +767,33 @@ cmd_tile() {
   fi
 
   case "$terminal" in
-    ghostty) ghostty_tile "$yolo" "$count" "${ports[@]}" ;;
-    tmux)    tmux_tile "$yolo" "$count" "${ports[@]}" ;;
+    ghostty) ghostty_tile "$agent" "$yolo" "$count" "${ports[@]}" ;;
+    tmux)    tmux_tile "$agent" "$yolo" "$count" "${ports[@]}" ;;
   esac
+}
+
+# The trailing `<yolo|-> <agent>` args every spawned pane gets, echoed with a
+# leading space so it appends straight onto the _init-port command line.
+init_port_suffix() {
+  local agent="$1" yolo="${2:-}"
+  [[ -z "$yolo" ]] && yolo="-"
+  echo " $yolo $agent"
 }
 
 # Internal: invoked by spawned panes during `new N`/`yolo N`. Creates the
 # worktree for a specific pre-assigned port, splits this pane into dev+shell
 # to match the single-pane layout, then execs the agent. Second arg: Ghostty
-# term id of this pane (captured at split time; unused under tmux). Optional
-# third arg `yolo`. Not in usage.
+# term id of this pane (captured at split time; unused under tmux). Third arg
+# `yolo` or `-`, fourth the agent name (both optional; '-'/empty = default).
+# Not in usage.
 cmd_init_port() {
   local port="${1:?[dork] _init-port requires a port}"
   local target_term_id="${2:-}"
   local yolo=""
   [[ "${3:-}" == yolo ]] && yolo="yolo"
+  local agent="${4:-}"
+  [[ "$agent" == "-" ]] && agent=""
+  agent="$(resolve_agent_name "$agent")"
 
   local terminal
   terminal="$(detect_terminal)"
@@ -657,7 +811,7 @@ cmd_init_port() {
     tmux)    tmux_split_dev_and_shell "$wt_path" "$dev_cmd" ;;
     none)    [[ -n "$dev_cmd" ]] && echo >&2 "[dork] Dev server: (cd $wt_path && $dev_cmd)" ;;
   esac
-  exec_agent "$wt_path" "$yolo"
+  exec_agent "$wt_path" "$agent" "$yolo"
 }
 
 # --- sync --------------------------------------------------------------------
@@ -1027,6 +1181,7 @@ so the branch stays alive between PRs (a --delete-branch merge works too; the
 next push re-creates it).
 
   1. Start of day    $PROG yolo 4             4 worktrees, ports $BASE_PORT-$MAX_PORT
+                     $PROG yolo codex 4       …with codex instead of claude
   2. Develop         edit + test on http://localhost:<port>, commit as you go
   3. Open a PR       $PROG pr "Fix the thing" (commits pending changes, then
                                               push + gh pr create; no title:
@@ -1151,9 +1306,19 @@ cmd_init() {
 #  echo "APP_URL=http://localhost:$2" >> "$1/.env.local"
 #}
 
-# Agent launched in each worktree pane (default: claude).
+# Coding agent launched in each worktree pane. Built in: claude, codex.
+# Pick per run with 'dork new codex' / 'dork yolo --codex'; set the
+# project default here, or your personal one with
+# `git config --global dork.agent codex` (which wins over this file).
+#DORK_AGENT=claude
+
+# Tweak how an agent is launched. The un-suffixed pair applies to whichever
+# agent is the default; the _<AGENT> pair applies to that agent only — which
+# is also how you teach dork an agent it doesn't know.
 #DORK_AGENT_CMD='claude'
 #DORK_YOLO_CMD='claude --dangerously-skip-permissions'
+#DORK_AGENT_CMD_CODEX='codex'
+#DORK_YOLO_CMD_CODEX='codex --dangerously-bypass-approvals-and-sandbox'
 
 # Trunk branch (default: auto-detected), worktree location, terminal backend.
 #DORK_MAIN_BRANCH=main
@@ -1276,10 +1441,8 @@ cmd_update() {
 [[ $# -ge 1 ]] || usage
 
 case "$1" in
-  new)         shift; repo_required
-               if [[ $# -ge 1 ]]; then cmd_tile "$@"; else cmd_new; fi ;;
-  yolo)        shift; repo_required
-               if [[ $# -ge 1 ]]; then cmd_tile yolo "$@"; else cmd_new yolo; fi ;;
+  new)         shift; repo_required; cmd_new_or_tile "" "$@" ;;
+  yolo)        shift; repo_required; cmd_new_or_tile yolo "$@" ;;
   _init-port)  shift; repo_required; cmd_init_port "$@" ;;
   sync)        shift; repo_required; cmd_sync "$@" ;;
   pr)          shift; repo_required; cmd_pr "$@" ;;
