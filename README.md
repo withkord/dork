@@ -225,9 +225,18 @@ docker (for the local stack); `gh` makes squash open the PR for you.
   schema doesn't back up, and when the DB turns out to have been **behind**
   the squash it offers a catch-up: the deleted migrations are recovered from
   git history and replayed in ONE transaction. Works from any state — your
-  own unapplied migration files included.
+  own unapplied migration files included, and a DB that applied a migration
+  **out of order** (a branch worktree's `migration up` before the squash
+  landed): the replay then skips exactly the entries that collide with what
+  the DB already contains, lists each skip with its Postgres error, and
+  refuses any failure that is not a collision. A migration that was renamed
+  past a baseline (`git mv` to a fresh timestamp) is replayed once, under its
+  final version.
 - **`dork db repair --verify-local`** — read-only shadow-DB diff of your
   local schema against the migration files.
+
+`test/db-catchup.sh` exercises the catch-up against a throwaway Postgres
+container and a synthetic history (needs docker).
 
 **The invariant:** squash and repair only ever change the bookkeeping table
 `supabase_migrations.schema_migrations`. Nothing in `dork db` runs

@@ -644,8 +644,44 @@ migration_ledger() {
     printf '%s\t9999999999\tfile:%s\n' "$v" "$path" >> "$tmp"
   done
 
-  sort -t"$(printf '\t')" -k1,1n -k2,2n "$tmp" | awk -F'\t' '!seen[$1]++ { print $1 "\t" $3 }'
+  sort -t"$(printf '\t')" -k1,1n -k2,2n "$tmp" | awk -F'\t' '!seen[$1]++ { print $1 "\t" $3 }' \
+  | ledger_without_renamed
   rm -f "$tmp"
+}
+
+# A migration renamed past a baseline (the rename_hint flow: same file, new
+# timestamp) sits in git under BOTH versions, and the boundary walk above
+# finds each of them. Replaying both runs the same DDL twice, and the second
+# copy fails on the first constraint it re-adds. Git recorded the rename, so
+# ask it: a rename under supabase/migrations/ whose target version is also on
+# the ledger retires its source version. Chains (A -> B -> C) resolve in one
+# pass because presence is tested against the ledger BEFORE anything is
+# retired. Retired versions are announced on stderr so the plan stays
+# explainable.
+ledger_without_renamed() {   # stdin/stdout: "<version>\t<source>" lines
+  local ledger_f renames_f
+  ledger_f=$(mktemp); renames_f=$(mktemp)
+  cat > "$ledger_f"
+  git log --format= -M --diff-filter=R --name-status -- supabase/migrations/ 2>/dev/null \
+  | awk -F'\t' '$1 ~ /^R/ && $2 ~ /\.sql$/ && $3 ~ /\.sql$/ {
+      o = $2; sub(/^.*\//, "", o); sub(/_.*$/, "", o)
+      n = $3; sub(/^.*\//, "", n); sub(/_.*$/, "", n)
+      if (o ~ /^[0-9]+$/ && n ~ /^[0-9]+$/ && o != n) print o "\t" n
+    }' > "$renames_f" || true
+  awk -F'\t' '
+    FILENAME == ARGV[1] { target[$1] = $2; next }
+    { ver[FNR] = $1; line[FNR] = $0; present[$1] = 1; n = FNR }
+    END {
+      for (i = 1; i <= n; i++) {
+        v = ver[i]
+        if ((v in target) && (target[v] in present)) {
+          printf "    renamed past a squash, replayed once: %s -> %s\n", v, target[v] > "/dev/stderr"
+          continue
+        }
+        print line[i]
+      }
+    }' "$renames_f" "$ledger_f"
+  rm -f "$ledger_f" "$renames_f"
 }
 
 # ---------------------------------------------------------------------------
@@ -658,7 +694,10 @@ DDB_L_SRC=()         # "git:<rev>:<path>" | "file:<path>" per index
 DDB_L_SQL=()         # materialized local path per index
 DDB_L_DIR=""         # temp dir holding the materialized SQL
 DDB_L_START=-1       # index the probe settled on
+DDB_L_PLAN=""        # index list the replay will run, in order
+DDB_L_SKIP=()        # "<index>\t<error>" per entry the sparse probe skipped
 DDB_TRIAL_ERR=""     # first error from the last failed trial
+DDB_TRIAL_STATE=""   # its SQLSTATE (5 chars), "" when psql gave none
 
 # Load the ledger (up to and including the baseline) into the globals and
 # materialize each entry's SQL. Versions NEWER than the baseline still have
@@ -691,35 +730,58 @@ ledger_load() {
 
 ledger_label() { printf '%s  %s' "${DDB_L_VER[$1]}" "$(basename "${DDB_L_SRC[$1]}")"; }
 
-# Paths of ledger entries [$1..$2] as a plain word list (for grep).
-ledger_paths() {
+# Every helper below takes an INDEX LIST ("3 4 7"), not a range: the sparse
+# probe replays with holes in it. ledger_range spells a range as a list.
+ledger_range() {
   local i="$1"
-  while [ "$i" -le "$2" ]; do printf '%s ' "${DDB_L_SQL[$i]}"; i=$((i + 1)); done
+  while [ "$i" -le "$2" ]; do printf '%s ' "$i"; i=$((i + 1)); done
 }
 
-ledger_stream() {  # $1..$2 = inclusive index range, concatenated to stdout
-  local i="$1"
-  while [ "$i" -le "$2" ]; do
+# Paths of the listed ledger entries as a plain word list (for grep).
+ledger_paths() {
+  local i
+  for i in $1; do printf '%s ' "${DDB_L_SQL[$i]}"; done
+}
+
+ledger_stream() {  # listed entries concatenated to stdout, in list order
+  local i
+  for i in $1; do
     printf '\n-- ===== %s =====\n' "${DDB_L_SRC[$i]}"
     cat "${DDB_L_SQL[$i]}"
-    i=$((i + 1))
   done
 }
 
-# Trial-apply ledger[$1..$2]. ALWAYS rolls back: the stream ends with a RAISE
-# that aborts the transaction, so the only way to "succeed" is for every
-# statement before it to have been accepted by Postgres. Returns 0 on a clean
-# trial. Nothing is ever written, which is what makes probing safe.
+# Trial-apply the listed ledger entries. ALWAYS rolls back: the stream ends
+# with a RAISE that aborts the transaction, so the only way to "succeed" is
+# for every statement before it to have been accepted by Postgres. Returns 0
+# on a clean trial. Nothing is ever written, which is what makes probing safe.
+# VERBOSITY=verbose makes psql prefix the message with its SQLSTATE, which is
+# what lets the sparse probe tell a collision from real drift.
 trial_apply() {
   local out rc=0
   out=$(mktemp)
   {
-    ledger_stream "$1" "$2"
+    ledger_stream "$1"
     printf '\nDO $ddb_probe$ BEGIN RAISE EXCEPTION %s; END $ddb_probe$;\n' "'DDB_TRIAL_ROLLBACK'"
-  } 2>/dev/null | psql_local --single-transaction -q > "$out" 2>&1 || rc=$?
+  } 2>/dev/null | psql_local -v VERBOSITY=verbose --single-transaction -q > "$out" 2>&1 || rc=$?
   if grep -q 'DDB_TRIAL_ROLLBACK' "$out"; then rm -f "$out"; return 0; fi
   DDB_TRIAL_ERR=$(grep -m1 'ERROR:' "$out" 2>/dev/null | sed 's/^psql:[^ ]*: *//' || true)
+  DDB_TRIAL_STATE=$(printf '%s' "$DDB_TRIAL_ERR" | sed -n 's/^ERROR: *\([0-9A-Z]\{5\}\):.*/\1/p')
   rm -f "$out"
+  return 1
+}
+
+# Did the last failed trial collide with something the DB already has (or
+# already lacks)? That is the signature of a migration that ALREADY RAN here:
+# its table/column/constraint/function exists, its unique row is present, or
+# the column it drops is gone. Anything else - a syntax error, a permission
+# error, a type mismatch - is real drift.
+trial_failed_on_collision() {
+  case "${DDB_TRIAL_STATE:-}" in
+    42P06|42P07|42701|42710|42723|42P16) return 0 ;;  # duplicate schema/table/column/object/function, "multiple primary keys"
+    42703|42P01|42704|42883)             return 0 ;;  # undefined column/table/object/function - what it drops is gone
+    23505)                               return 0 ;;  # unique_violation - its seed row is present
+  esac
   return 1
 }
 
@@ -742,13 +804,84 @@ ledger_probe() {
   while [ "$i" -lt "$DDB_L_N" ]; do
     checked=$((checked + 1))
     if [ $((checked % 25)) -eq 0 ]; then printf '    ... probed %s of %s\n' "$checked" "$DDB_L_N"; fi
-    if trial_apply "$i" "$i" && trial_apply "$i" "$((DDB_L_N - 1))"; then
+    if trial_apply "$i" && trial_apply "$(ledger_range "$i" "$((DDB_L_N - 1))")"; then
       DDB_L_START="$i"
+      DDB_L_PLAN=$(ledger_range "$i" "$((DDB_L_N - 1))")
+      DDB_L_SKIP=()
       return 0
     fi
     i=$((i + 1))
   done
   return 1
+}
+
+# Second strategy, for a DB that applied migrations OUT OF ORDER - the shape
+# every branch worktree produces: `migration up` on the branch applies that
+# branch's file, the squash lands, and the trunk migrations in between never
+# ran here. No contiguous suffix replays onto such a DB, because the suffix
+# always contains the branch migration and that one collides. So build the
+# set one entry at a time: each entry is trial-applied on top of the set so
+# far; one that fails with a COLLISION (trial_failed_on_collision) already
+# ran here and is skipped, and any other failure is real drift and stops the
+# run. Every skip is kept in DDB_L_SKIP for the plan to show.
+#
+# Where to start is the one thing this strategy cannot probe for (every
+# entry before the true start collides too), so the caller anchors it on the
+# column check: the earliest entry that mentions something the schema is
+# missing. Anything older is either applied or idempotent, and an unapplied
+# function-body change older than the anchor is what the post-replay
+# shadow-database diff reports.
+ledger_probe_sparse() {
+  local i="$1" plan="" checked=0
+  DDB_L_START=-1; DDB_L_PLAN=""; DDB_L_SKIP=()
+  while [ "$i" -lt "$DDB_L_N" ]; do
+    checked=$((checked + 1))
+    if [ $((checked % 25)) -eq 0 ]; then printf '    ... probed %s of %s\n' "$checked" "$((DDB_L_N - $1))"; fi
+    if trial_apply "$plan $i"; then
+      plan="$plan $i"
+    elif trial_failed_on_collision; then
+      DDB_L_SKIP+=("$i	${DDB_TRIAL_ERR}")
+    else
+      return 1
+    fi
+    i=$((i + 1))
+  done
+  [ -n "$plan" ] || return 1
+  DDB_L_START="$1"
+  DDB_L_PLAN="${plan# }"
+  return 0
+}
+
+# Earliest ledger index whose SQL names a table.column the column check says
+# the schema is missing - the entry that INTRODUCED the first gap, and so the
+# anchor for the sparse probe. Whole-word matches on both names, in the same
+# file, keep `id` and `created_at` from matching everything. Prints nothing
+# when the schema has no column gaps.
+ledger_gap_anchor() {
+  local gaps tables_f hits t c i
+  gaps=$(baseline_schema_gaps 2>/dev/null || true)
+  [ -n "$gaps" ] || return 0
+  tables_f=$(mktemp)
+  printf '%s\n' "$gaps" | cut -d. -f1 | sort -u > "$tables_f"
+  i=0
+  while [ "$i" -lt "$DDB_L_N" ]; do
+    # One grep per entry names the gap tables it mentions; most mention none.
+    hits=$(grep -owF -f "$tables_f" "${DDB_L_SQL[$i]}" 2>/dev/null | sort -u || true)
+    if [ -n "$hits" ]; then
+      while IFS=. read -r t c; do
+        [ -n "$t" ] || continue
+        printf '%s\n' "$hits" | grep -qxF "$t" || continue
+        if grep -qwF "$c" "${DDB_L_SQL[$i]}"; then
+          rm -f "$tables_f"; printf '%s\n' "$i"; return 0
+        fi
+      done <<EOF
+$gaps
+EOF
+    fi
+    i=$((i + 1))
+  done
+  rm -f "$tables_f"
+  return 0
 }
 
 # One failure shape deserves its own explanation: an enum value added by one
@@ -985,43 +1118,75 @@ catchup_local() {
   fi
 
   log "Probing where this DB actually sits (every trial rolls back - nothing is written)"
-  if ! ledger_probe "$from"; then
-    if [ "$from" -ne 0 ] && ledger_probe 0; then
-      : # the hint was wrong; the full scan found it
-    else
+  # The entry that introduced the first column gap. A migration applied OUT OF
+  # ORDER (a branch worktree's `migration up`) breaks the contiguous probe in
+  # one of two ways, and this anchor is what resolves both: with the stray
+  # migration at the end of history no suffix replays at all; with it in the
+  # middle, the earliest clean suffix starts AFTER it - past unapplied
+  # entries, which the gap check would then fail on after the replay.
+  local anchor; anchor=$(ledger_gap_anchor)
+  local contiguous=0
+  if ledger_probe "$from"; then contiguous=1
+  elif [ "$from" -ne 0 ] && ledger_probe 0; then contiguous=1   # the hint was wrong; the full scan found it
+  fi
+  if [ "$contiguous" -eq 1 ] && [ -n "$anchor" ] && [ "$anchor" -lt "$DDB_L_START" ]; then
+    echo "  a contiguous run replays from ${DDB_L_VER[$DDB_L_START]}, but the schema is missing what"
+    echo "  ${DDB_L_VER[$anchor]} introduces - this DB applied something out of order"
+    contiguous=0
+  fi
+  if [ "$contiguous" -eq 0 ]; then
+    local first_err="${DDB_TRIAL_ERR:-none}"
+    if [ -z "$anchor" ] && [ "$from" -gt 0 ]; then anchor="$from"; fi
+    if [ -n "$anchor" ]; then
+      echo "  probing from ${DDB_L_VER[$anchor]} (the first entry the schema is missing), skipping what already ran"
+    fi
+    if [ -z "$anchor" ] || ! ledger_probe_sparse "$anchor"; then
       warn "No point in the recorded history replays cleanly onto this DB."
-      more "Last error from the closest attempt: ${DDB_TRIAL_ERR:-none}"
+      more "Last error from the closest attempt: ${DDB_TRIAL_ERR:-$first_err}"
       explain_enum_txn_error
       abort "This DB has drifted in a way catch-up cannot repair automatically. Nothing was changed."
     fi
   fi
-  local start="$DDB_L_START" end=$((DDB_L_N - 1))
+  local start="$DDB_L_START" plan="$DDB_L_PLAN" i n_plan=0
+  for i in $plan; do n_plan=$((n_plan + 1)); done
   echo "  this DB sits just before ${DDB_L_VER[$start]}"
 
   # Statements that cannot run inside a transaction would break the
   # all-or-nothing guarantee, so refuse rather than half-apply.
   local hostile
   hostile=$(grep -liE 'concurrently|^[[:space:]]*(commit|rollback)[[:space:]]*;' \
-    $(ledger_paths "$start" "$end") 2>/dev/null || true)
+    $(ledger_paths "$plan") 2>/dev/null || true)
   if [ -n "$hostile" ]; then
     warn "These migrations contain statements that cannot run inside a transaction:"
     printf '%s\n' "$hostile" | sed 's/^/      /' >&2
     abort "Refusing to replay - an interrupted run could half-apply. Apply them by hand from git."
   fi
 
-  log "Plan: replay $((end - start + 1)) migration(s) recovered from git, in ONE transaction"
-  local i="$start"
-  while [ "$i" -le "$end" ]; do
+  log "Plan: replay ${n_plan} migration(s) recovered from git, in ONE transaction"
+  for i in $plan; do
     printf '      %s\n' "$(ledger_label "$i")"
-    i=$((i + 1))
   done
+  if [ "${#DDB_L_SKIP[@]}" -gt 0 ]; then
+    echo
+    echo "  ${#DDB_L_SKIP[@]} migration(s) in that range are SKIPPED - each collides with what this DB"
+    echo "  already contains, which means it ran here before the ones above did:"
+    local skip
+    for skip in "${DDB_L_SKIP[@]}"; do
+      printf '      %s\n' "$(ledger_label "${skip%%	*}")"
+      printf '        %s\n' "${skip#*	}"
+    done
+    echo "  The checks after the replay (columns, then the shadow-database diff) certify"
+    echo "  the result, so a skip that was wrong cannot pass quietly."
+  fi
   echo
   echo "  These are the real migration files, in their original order, exactly as they"
   echo "  ran on every other machine. All-or-nothing: any error rolls the whole set back."
   echo "  This is NOT 'db reset' - your local data stays where it is."
-  echo "  The first one or two may already be applied here; they are on the list only"
-  echo "  because they are idempotent, and re-running them is a no-op. Catch-up starts at"
-  echo "  the earliest point that still applies cleanly so it cannot skip anything."
+  if [ "${#DDB_L_SKIP[@]}" -eq 0 ]; then
+    echo "  The first one or two may already be applied here; they are on the list only"
+    echo "  because they are idempotent, and re-running them is a no-op. Catch-up starts at"
+    echo "  the earliest point that still applies cleanly so it cannot skip anything."
+  fi
   confirm "Apply them to the LOCAL docker DB now?"
 
   local backup
@@ -1029,23 +1194,21 @@ catchup_local() {
   if [ -n "$backup" ]; then echo "  pre-replay dump: ${backup}"; else warn "Could not take a pre-replay pg_dump (continuing - the replay is still atomic)."; fi
 
   log "Replaying"
-  if ! { ledger_stream "$start" "$end"
-         i="$start"
-         while [ "$i" -le "$end" ]; do
+  if ! { ledger_stream "$plan"
+         for i in $plan; do
            # Only versions that still HAVE a file get a bookkeeping row; the
            # rest were consumed by the squash and would be reverted as
            # orphans anyway.
            if [ -n "$(file_for_version "${DDB_L_VER[$i]}")" ]; then
              printf "\ninsert into supabase_migrations.schema_migrations(version) values ('%s') on conflict do nothing;\n" "${DDB_L_VER[$i]}"
            fi
-           i=$((i + 1))
          done
        } | psql_local --single-transaction -q; then
     warn "The replay failed and was rolled back in full - the database is untouched."
     [ -n "$backup" ] && warn "(Pre-replay dump is still at ${backup}.)"
     abort "Catch-up aborted."
   fi
-  echo "  applied ${DDB_L_VER[$start]} .. ${DDB_L_VER[$end]}"
+  echo "  applied ${n_plan} migration(s), ${DDB_L_VER[${plan%% *}]} .. ${DDB_L_VER[${plan##* }]}"
 
   log "Verifying the result"
   local post_rc=0
