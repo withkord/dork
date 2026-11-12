@@ -146,6 +146,31 @@ receipt_path() {
   printf '%s/%s' "$dir" "$1"
 }
 
+# Supabase CLI 3.x renamed the scope flags: `--linked` became `--remote`, and
+# `--local` is the default (both old spellings warn now and go away in v4).
+# Every call site below keeps the 2.x spelling; this wrapper translates it
+# when the installed CLI is 3.x or newer, so 2.x keeps working untouched. A
+# CLI whose version can't be read (old, or a test shim) is left alone.
+# Detected once, here: most calls run inside $(...), a subshell, where a lazy
+# cache would never stick.
+SUPABASE_MAJOR=$(command supabase --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1 || true)
+case "$SUPABASE_MAJOR" in ''|*[!0-9]*) SUPABASE_MAJOR=0 ;; esac
+supabase() {
+  if [ "$SUPABASE_MAJOR" -lt 3 ]; then
+    command supabase "$@"
+    return
+  fi
+  local a args=()
+  for a in "$@"; do
+    case "$a" in
+      --linked) args+=(--remote) ;;
+      --local)  ;;
+      *)        args+=("$a") ;;
+    esac
+  done
+  command supabase ${args[@]+"${args[@]}"}
+}
+
 # =============================================================================
 # Repo root + project config
 # =============================================================================
@@ -357,6 +382,37 @@ acl_reset_insert() {
   log "Step 4c: inserted the ACL reset ahead of the GRANT block (before line ${first_acl})"
   echo "  revokes from: ${ACL_RESET_ROLES}"
 }
+# squash-append blocks are copied forward from the old baseline verbatim, but
+# the fresh dump only creates relations that still exist on the linked
+# project. A GRANT/REVOKE in a block for a relation dropped since the last
+# squash would make the baseline fail to apply ("relation does not exist"),
+# so drop exactly those lines - in place, in the extracted blocks file - and
+# say which. Only single-line GRANT/REVOKE on public.<name> is touched; any
+# other stale DDL still fails the Step 6 gate loudly.
+prune_append_blocks() {
+  local blocks="$1" baseline="$2"
+  local created; created=$(mktemp)
+  grep -ioE '^CREATE (OR REPLACE )?(UNLOGGED |FOREIGN |MATERIALIZED )?(TABLE|VIEW|SEQUENCE)( IF NOT EXISTS)? "?public"?\."?[A-Za-z0-9_]+' "$baseline" \
+    | sed -E 's/.*\."?//' | sort -u > "$created" || true
+  local pruned; pruned=$(mktemp)
+  local kept; kept=$(mktemp)
+  awk -v created="$created" -v pruned="$pruned" '
+    BEGIN { while ((getline n < created) > 0) have[n] = 1 }
+    /^(GRANT|REVOKE) / && match($0, / ON (TABLE |SEQUENCE )?"?public"?\."?[A-Za-z0-9_]+/) {
+      rel = substr($0, RSTART, RLENGTH); sub(/.*\."?/, "", rel)
+      if (!(rel in have)) { print rel >> pruned; next }
+    }
+    { print }
+  ' "$blocks" > "$kept"
+  mv "$kept" "$blocks"
+  if [ -s "$pruned" ]; then
+    echo "  pruned grant/revoke lines for relations the new dump no longer creates:"
+    sort "$pruned" | uniq -c | awk '{ printf "    public.%s (%d line%s)\n", $2, $1, ($1 == 1 ? "" : "s") }'
+    more "Check the block comments for counts or names that mention them."
+  fi
+  rm -f "$created" "$pruned"
+}
+
 version_of()        { basename "$1" | cut -d_ -f1; }
 
 # The BASELINE is the file a squash consolidated everything into - the only
@@ -572,6 +628,14 @@ parse_drift() {
 
   # Primary path: the default non-TTY output on CLI 2.x is JSON.
   if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    # CLI 3.x reports failures (not linked, auth, unreachable DB) as a JSON
+    # envelope with no .migrations - which the filter below would read as
+    # "no drift". Anything without a migrations array is a failure.
+    if ! printf '%s' "$raw" | jq -e '(.migrations | type) == "array"' >/dev/null 2>&1; then
+      warn "'supabase migration list ${scope}' did not return a migration list:"
+      printf '%s\n' "$raw" | jq -r '.error.message // .' 2>/dev/null | head -5 >&2
+      return 1
+    fi
     printf '%s' "$raw" | jq -r '
       .migrations[]?
       | if .local != "" and .remote == "" then "L \(.local)"
@@ -1254,7 +1318,8 @@ reconcile_bookkeeping() {
   local desc; if [ "$scope" = "--local" ]; then desc="local Supabase stack (docker)"; else desc="linked remote project"; fi
 
   log "Reconciling migration bookkeeping on ${desc} - metadata-only (schema, RLS, data, storage untouched)"
-  local drift; drift=$(parse_drift "$scope")
+  local drift
+  drift=$(parse_drift "$scope") || abort "Could not read the migration list on ${desc} - refusing to guess. Nothing was changed."
   local to_apply to_revert
   to_apply=$(echo "$drift"  | awk '/^L /{print $2}')   # file, no DB row
   to_revert=$(echo "$drift" | awk '/^R /{print $2}')   # DB row, no file → reverted
@@ -1940,6 +2005,7 @@ cmd_squash() {
       log "Step 5c: squash-append blocks already in baseline. Skipping append."
     else
       log "Step 5c: re-appending squash-append blocks to ${NEW_BASELINE}"
+      prune_append_blocks "$APPENDED_BLOCKS" "$NEW_BASELINE"
       cat "$APPENDED_BLOCKS" >> "$NEW_BASELINE"
       grep '^-- >>> squash-append' "$NEW_BASELINE" | sed 's/^/    /'
     fi
