@@ -585,7 +585,9 @@ parse_drift() {
   # Fallback: the human "pretty table", parsed ONLY when we positively
   # recognize it by its header. The table backtick-quotes 14-digit versions;
   # a blank Local cell = drift "R" material, a blank Remote cell = "L".
-  if printf '%s' "$raw" | grep -qE 'Local[[:space:]]*\|[[:space:]]*Remote'; then
+  # CLI 3.x names the second column after the target ("Local DB" for
+  # --local) instead of "Remote", so accept either.
+  if printf '%s' "$raw" | grep -qE 'Local[[:space:]]*\|[[:space:]]*(Remote|Local DB)'; then
     printf '%s\n' "$raw" | awk -F'|' '
       {
         l = $1; r = $2
