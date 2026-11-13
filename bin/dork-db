@@ -1220,8 +1220,13 @@ catchup_local() {
   # Statements that cannot run inside a transaction would break the
   # all-or-nothing guarantee, so refuse rather than half-apply.
   local hostile
-  hostile=$(grep -liE 'concurrently|^[[:space:]]*(commit|rollback)[[:space:]]*;' \
-    $(ledger_paths "$plan") 2>/dev/null || true)
+  # SQL line comments are ignored: a comment that only names CONCURRENTLY is safe.
+  local f
+  hostile=$(for f in $(ledger_paths "$plan"); do
+    sed 's/--.*$//' "$f" 2>/dev/null |
+      grep -qiE 'concurrently|^[[:space:]]*(commit|rollback)[[:space:]]*;' &&
+      printf '%s\n' "$f"
+  done || true)
   if [ -n "$hostile" ]; then
     warn "These migrations contain statements that cannot run inside a transaction:"
     printf '%s\n' "$hostile" | sed 's/^/      /' >&2
