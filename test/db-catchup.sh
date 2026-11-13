@@ -195,6 +195,65 @@ expect "non-collision failure is still refused" "$out" \
   "+cannot repair automatically. Nothing was changed" \
   "-Catch-up complete"
 
+# --- 5. a DB that is simply behind, with misleading migration TEXT ---------
+# Its own history: 1 creates p and s and, in a comment, happens to use the
+# word "kind"; 2 gives s a NOT NULL kind; 3 (the baseline) gives p a kind.
+# The DB ran 1 and 2, so the only gap is p.kind and replaying 3 is the whole
+# answer. Text-matching reads 1 as "the entry that introduces p.kind" and
+# restarts the search there, where 1's insert now fails on s.kind (23502) -
+# a healthy DB reported as unrepairable drift. The plan must be judged by
+# the schema it produces instead.
+REPO2="$WORK/repo2"; M2="$REPO2/supabase/migrations"
+mkdir -p "$M2"
+cd "$REPO2"
+git init -q; git config user.email t@example.com; git config user.name t
+printf 'project_id = "dorktest"\n\n[db]\nport = %s\n' "$PORT" > supabase/config.toml
+cat > "$M2/${V1}_base.sql" <<'SQL'
+-- p and s; which kind of row s holds is decided later
+create table if not exists public.p (key text primary key);
+create table if not exists public.s (key text primary key);
+insert into public.s (key) values ('seed');
+SQL
+cat > "$M2/${V2}_s_kind.sql" <<'SQL'
+alter table public.s add column kind text;
+update public.s set kind = 'x';
+alter table public.s alter column kind set not null;
+SQL
+echo 'alter table public.p add column kind text;' > "$M2/${V3}_p_kind.sql"
+git add -A; git commit -qm "history"
+git rm -q "$M2/${V1}_base.sql" "$M2/${V2}_s_kind.sql"
+cat > "$M2/${V3}_p_kind.sql" <<'SQL'
+-- dork-db:baseline (squashed by test)
+CREATE TABLE IF NOT EXISTS "public"."p" (
+    "key" text NOT NULL,
+    "kind" text
+);
+CREATE TABLE IF NOT EXISTS "public"."s" (
+    "key" text NOT NULL,
+    "kind" text NOT NULL
+);
+SQL
+git add -A; git commit -qm "Squash migrations into ${V3}_p_kind"
+
+sql <<'SQL' >/dev/null
+drop schema if exists public cascade; create schema public;
+drop table if exists supabase_migrations.schema_migrations;
+create table supabase_migrations.schema_migrations (version text primary key, statements text[], name text);
+SQL
+for v in "$V1" "$V2"; do
+  path=$(git ls-tree --name-only HEAD~1 supabase/migrations/ | grep "/${v}_")
+  git show "HEAD~1:${path}" | sql >/dev/null
+  printf "insert into supabase_migrations.schema_migrations(version) values ('%s');" "$v" | sql >/dev/null
+done
+out=$(run_catchup)
+expect "misleading text does not veto a complete contiguous plan" "$out" \
+  "+this DB sits just before ${V3}" \
+  "-out of order" \
+  "-23502" \
+  "-SKIPPED" \
+  "+Catch-up complete"
+[ "$(columns)" = "p.key p.kind s.key s.kind " ] && echo "PASS  schema complete (misleading text)" || { echo "FAIL  schema: $(columns)"; FAIL=$((FAIL + 1)); }
+
 echo
 echo "passed ${PASS}, failed ${FAIL}"
 [ "$FAIL" -eq 0 ]

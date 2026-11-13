@@ -498,12 +498,18 @@ backup_schema_migrations_local() {
 # behind when the squash landed" and offers to replay history that is already
 # applied. So subtract the post-baseline drops before comparing.
 baseline_schema_gaps() {
-  local bf; bf=$(baseline_file)
-  [ -n "$bf" ] || return 1
   ensure_local_db_conn
-
   local actual
   actual=$(psql_local_query "select table_name || '.' || column_name from information_schema.columns where table_schema = 'public';")
+  baseline_gaps_against "$actual"
+}
+
+# The comparison itself, against any "<table>.<column>" list ($1) - the live
+# schema above, or the schema a trial replay WOULD produce (trial_apply_gaps).
+baseline_gaps_against() {
+  local bf; bf=$(baseline_file)
+  [ -n "$bf" ] || return 1
+  local actual="$1"
   [ -n "$actual" ] || return 1   # stack down, or no public schema at all - unknown
 
   local declared_f actual_f dropped_f
@@ -837,6 +843,34 @@ trial_apply() {
   return 1
 }
 
+# Trial-apply the listed entries and MEASURE the result: the columns public
+# would have afterwards are read inside the same transaction, just before the
+# rollback, and compared with the baseline. Returns 0 on a clean trial with
+# what the replay would still leave missing in DDB_TRIAL_GAPS ("" = nothing);
+# 1 when the trial failed (DDB_TRIAL_ERR set, as for trial_apply) or the
+# columns could not be read. This is how a candidate plan is judged: by the
+# schema it produces, never by what the migration text appears to mention.
+DDB_TRIAL_GAPS=""
+trial_apply_gaps() {
+  local out cols
+  out=$(mktemp)
+  DDB_TRIAL_GAPS=""
+  {
+    ledger_stream "$1"
+    printf "\nselect 'DDB_TRIAL_COL ' || table_name || '.' || column_name from information_schema.columns where table_schema = 'public';\n"
+    printf '\nDO $ddb_probe$ BEGIN RAISE EXCEPTION %s; END $ddb_probe$;\n' "'DDB_TRIAL_ROLLBACK'"
+  } 2>/dev/null | psql_local -v VERBOSITY=verbose --single-transaction -Atq > "$out" 2>&1 || true
+  if ! grep -q 'DDB_TRIAL_ROLLBACK' "$out"; then
+    DDB_TRIAL_ERR=$(grep -m1 'ERROR:' "$out" 2>/dev/null | sed 's/^psql:[^ ]*: *//' || true)
+    DDB_TRIAL_STATE=$(printf '%s' "$DDB_TRIAL_ERR" | sed -n 's/^ERROR: *\([0-9A-Z]\{5\}\):.*/\1/p')
+    rm -f "$out"; return 1
+  fi
+  cols=$(sed -n 's/^DDB_TRIAL_COL //p' "$out")
+  rm -f "$out"
+  DDB_TRIAL_GAPS=$(baseline_gaps_against "$cols") || return 1
+  return 0
+}
+
 # Did the last failed trial collide with something the DB already has (or
 # already lacks)? That is the signature of a migration that ALREADY RAN here:
 # its table/column/constraint/function exists, its unique row is present, or
@@ -918,14 +952,17 @@ ledger_probe_sparse() {
   return 0
 }
 
-# Earliest ledger index whose SQL names a table.column the column check says
-# the schema is missing - the entry that INTRODUCED the first gap, and so the
-# anchor for the sparse probe. Whole-word matches on both names, in the same
-# file, keep `id` and `created_at` from matching everything. Prints nothing
-# when the schema has no column gaps.
+# Earliest ledger index whose SQL names one of the given table.column gaps
+# ($1, one per line) - a starting point for the sparse probe. Whole-word
+# matches on both names, in the same file, keep `id` and `created_at` from
+# matching everything. Prints nothing when given no gaps.
+#
+# This reads migration TEXT, so it is a hint and nothing more: a comment that
+# says "project" beside an unrelated "domain" column matches project.domain.
+# It may only ever choose where a search STARTS. Whether a plan is complete
+# is decided by trial_apply_gaps, which measures.
 ledger_gap_anchor() {
-  local gaps tables_f hits t c i
-  gaps=$(baseline_schema_gaps 2>/dev/null || true)
+  local gaps="$1" tables_f hits t c i
   [ -n "$gaps" ] || return 0
   tables_f=$(mktemp)
   printf '%s\n' "$gaps" | cut -d. -f1 | sort -u > "$tables_f"
@@ -1184,24 +1221,36 @@ catchup_local() {
   fi
 
   log "Probing where this DB actually sits (every trial rolls back - nothing is written)"
-  # The entry that introduced the first column gap. A migration applied OUT OF
-  # ORDER (a branch worktree's `migration up`) breaks the contiguous probe in
-  # one of two ways, and this anchor is what resolves both: with the stray
-  # migration at the end of history no suffix replays at all; with it in the
-  # middle, the earliest clean suffix starts AFTER it - past unapplied
-  # entries, which the gap check would then fail on after the replay.
-  local anchor; anchor=$(ledger_gap_anchor)
-  local contiguous=0
+  # A contiguous suffix that replays cleanly is the plan - provided it is
+  # COMPLETE. A migration applied OUT OF ORDER (a branch worktree's
+  # `migration up`) breaks the contiguous probe in one of two ways: with the
+  # stray migration at the end of history no suffix replays at all; with it in
+  # the middle, the earliest clean suffix starts AFTER it, past entries that
+  # never ran here. The second case is told apart by measuring: trial-apply
+  # the suffix and read what the schema would still be missing. Nothing
+  # missing = this DB was simply behind, and the suffix is the answer.
+  local contiguous=0 left=""
   if ledger_probe "$from"; then contiguous=1
   elif [ "$from" -ne 0 ] && ledger_probe 0; then contiguous=1   # the hint was wrong; the full scan found it
   fi
-  if [ "$contiguous" -eq 1 ] && [ -n "$anchor" ] && [ "$anchor" -lt "$DDB_L_START" ]; then
-    echo "  a contiguous run replays from ${DDB_L_VER[$DDB_L_START]}, but the schema is missing what"
-    echo "  ${DDB_L_VER[$anchor]} introduces - this DB applied something out of order"
-    contiguous=0
+  if [ "$contiguous" -eq 1 ]; then
+    if ! trial_apply_gaps "$DDB_L_PLAN"; then
+      abort "Could not read the schema the replay would produce - refusing to guess. Nothing was changed."
+    fi
+    left="$DDB_TRIAL_GAPS"
+    if [ -n "$left" ]; then
+      echo "  a contiguous run replays from ${DDB_L_VER[$DDB_L_START]}, but would still leave the schema missing"
+      echo "  $(printf '%s\n' "$left" | head -3 | tr '\n' ' ')- this DB applied something out of order"
+      contiguous=0
+    fi
   fi
   if [ "$contiguous" -eq 0 ]; then
     local first_err="${DDB_TRIAL_ERR:-none}"
+    # Where the sparse probe starts: the earliest entry naming a gap the
+    # contiguous run would NOT close (or, with no contiguous run at all, any
+    # gap the schema has now).
+    [ -n "$left" ] || left=$(baseline_schema_gaps 2>/dev/null || true)
+    local anchor; anchor=$(ledger_gap_anchor "$left")
     if [ -z "$anchor" ] && [ "$from" -gt 0 ]; then anchor="$from"; fi
     if [ -n "$anchor" ]; then
       echo "  probing from ${DDB_L_VER[$anchor]} (the first entry the schema is missing), skipping what already ran"
@@ -1210,6 +1259,13 @@ catchup_local() {
       warn "No point in the recorded history replays cleanly onto this DB."
       more "Last error from the closest attempt: ${DDB_TRIAL_ERR:-$first_err}"
       explain_enum_txn_error
+      abort "This DB has drifted in a way catch-up cannot repair automatically. Nothing was changed."
+    fi
+    # Same standard as the contiguous plan: judged by the schema it produces,
+    # BEFORE anything is written, not discovered after the replay.
+    if ! trial_apply_gaps "$DDB_L_PLAN" || [ -n "$DDB_TRIAL_GAPS" ]; then
+      warn "The closest replay would still leave the schema short of the baseline, e.g.:"
+      printf '%s\n' "$DDB_TRIAL_GAPS" | head -8 | sed 's/^/      /' >&2
       abort "This DB has drifted in a way catch-up cannot repair automatically. Nothing was changed."
     fi
   fi
