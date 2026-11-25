@@ -176,37 +176,100 @@ resolve_branch_prefix() {
 
 # --- Project-command detection ----------------------------------------------
 
-# Dependency install command for a fresh worktree, echoed (empty = skip).
-resolve_install_cmd() {
-  if declare -F dork_install_deps >/dev/null; then
-    echo "__fn__"
-    return
+# How deep below the repo root dork looks for lockfiles (0 = root only).
+# 2 covers the common layouts: web/, apps/web/, backend/.
+DORK_LOCKFILE_DEPTH="${DORK_LOCKFILE_DEPTH:-2}"
+
+# Install commands for the lockfiles in ONE directory, one per line. A
+# directory gets at most one JS install (pnpm > yarn > bun > npm, so a stray
+# package-lock.json next to pnpm-lock.yaml doesn't win), one Python install,
+# and one Ruby install, because a dir can legitimately hold e.g. both a
+# package.json and a pyproject.toml.
+install_cmds_for_dir() {
+  local d="$1" skip_js="${2:-0}"
+  if   [[ "$skip_js" == 1 ]];                            then :
+  elif [[ -f "$d/pnpm-lock.yaml" ]];                     then echo "pnpm install --frozen-lockfile"
+  elif [[ -f "$d/yarn.lock" ]];                          then echo "yarn install --frozen-lockfile"
+  elif [[ -f "$d/bun.lockb" || -f "$d/bun.lock" ]];      then echo "bun install"
+  elif [[ -f "$d/package-lock.json" ]];                  then echo "npm ci"
   fi
-  if [[ -n "${DORK_INSTALL_CMD:-}" ]]; then
-    echo "$DORK_INSTALL_CMD"
-    return
+  if   [[ -f "$d/uv.lock" ]];                            then echo "uv sync"
+  elif [[ -f "$d/poetry.lock" ]];                        then echo "poetry install"
   fi
-  if   [[ -f "$REPO_ROOT/pnpm-lock.yaml" ]];     then echo "pnpm install --frozen-lockfile"
-  elif [[ -f "$REPO_ROOT/yarn.lock" ]];          then echo "yarn install --frozen-lockfile"
-  elif [[ -f "$REPO_ROOT/package-lock.json" ]];  then echo "npm ci"
-  elif [[ -f "$REPO_ROOT/bun.lockb" || -f "$REPO_ROOT/bun.lock" ]]; then echo "bun install"
-  elif [[ -f "$REPO_ROOT/uv.lock" ]];            then echo "uv sync"
-  elif [[ -f "$REPO_ROOT/poetry.lock" ]];        then echo "poetry install"
-  elif [[ -f "$REPO_ROOT/Gemfile.lock" ]];       then echo "bundle install"
-  else echo ""
+  if   [[ -f "$d/Gemfile.lock" ]];                       then echo "bundle install"
   fi
 }
 
+# Directories (relative to the worktree, '.' for the root) that hold a
+# tracked lockfile, root first, as "<dir>\t<skip_js>". Only tracked files
+# count, so node_modules, .venv and other vendored copies never match.
+# skip_js=1 when an ancestor has a JS lockfile: in a pnpm/yarn/npm workspace
+# the root install covers every package, and nested JS lockfiles there are
+# usually fixtures or examples. Other ecosystems in that dir still install.
+lockfile_dirs() {
+  local wt_path="$1"
+  git -C "$wt_path" ls-files -- \
+      'pnpm-lock.yaml' 'yarn.lock' 'package-lock.json' 'bun.lockb' 'bun.lock' \
+      'uv.lock' 'poetry.lock' 'Gemfile.lock' \
+      '**/pnpm-lock.yaml' '**/yarn.lock' '**/package-lock.json' '**/bun.lockb' '**/bun.lock' \
+      '**/uv.lock' '**/poetry.lock' '**/Gemfile.lock' 2>/dev/null \
+    | awk -v max="$DORK_LOCKFILE_DEPTH" '
+        { dir = $0; sub(/\/?[^\/]*$/, "", dir); if (dir == "") dir = ".";
+          depth = (dir == ".") ? 0 : gsub(/\//, "/", dir) + 1;
+          if (depth <= max && !(dir in seen)) { seen[dir] = 1; dirs[++n] = dir }
+          if ($0 ~ /(^|\/)(pnpm-lock\.yaml|yarn\.lock|package-lock\.json|bun\.lockb?)$/) js[dir] = 1 }
+        END {
+          if ("." in seen) print ".\t0"
+          for (i = 1; i <= n; i++) {
+            d = dirs[i]; if (d == ".") continue
+            skip = 0
+            for (j in js) if (j != d && (j == "." || index(d, j "/") == 1)) skip = 1
+            print d "\t" skip
+          }
+        }'
+}
+
+# The install plan for a fresh worktree, one "<dir>\t<command>" per line
+# (empty = nothing to install). DORK_INSTALL_CMD runs at the root and
+# replaces detection; a dork_install_deps function replaces both.
+resolve_install_plan() {
+  local wt_path="$1" dir skip_js cmd
+  if declare -F dork_install_deps >/dev/null; then
+    printf '.\t__fn__\n'
+    return
+  fi
+  if [[ -n "${DORK_INSTALL_CMD:-}" ]]; then
+    printf '.\t%s\n' "$DORK_INSTALL_CMD"
+    return
+  fi
+  while IFS=$'\t' read -r dir skip_js; do
+    while IFS= read -r cmd; do
+      [[ -n "$cmd" ]] && printf '%s\t%s\n' "$dir" "$cmd"
+    done < <(install_cmds_for_dir "$wt_path/$dir" "$skip_js")
+  done < <(lockfile_dirs "$wt_path")
+}
+
 run_install_deps() {
-  local wt_path="$1" cmd
-  cmd="$(resolve_install_cmd)"
-  if [[ "$cmd" == "__fn__" ]]; then
+  local wt_path="$1" plan dir cmd summary=""
+  plan="$(resolve_install_plan "$wt_path")"
+  [[ -z "$plan" ]] && return 0
+  if [[ "$plan" == $'.\t__fn__' ]]; then
     echo >&2 "[dork] Installing dependencies (dork_install_deps)"
     (cd "$wt_path" && dork_install_deps "$wt_path") >&2
-  elif [[ -n "$cmd" ]]; then
-    echo >&2 "[dork] Installing dependencies: $cmd"
-    (cd "$wt_path" && eval "$cmd") >&2
+    return
   fi
+  while IFS=$'\t' read -r dir cmd; do
+    summary+="${summary:+, }${cmd%% *} ($dir)"
+  done <<< "$plan"
+  echo >&2 "[dork] Detected: $summary"
+  while IFS=$'\t' read -r dir cmd; do
+    echo >&2 "[dork] Installing dependencies in $dir: $cmd"
+    # stdin from /dev/null: the plan is read from this loop's stdin, and an
+    # install that reads stdin would otherwise swallow the remaining lines.
+    if ! (cd "$wt_path/$dir" && eval "$cmd") </dev/null >&2; then
+      echo >&2 "[dork] '$cmd' failed in $dir; continuing. Re-run it by hand, or set DORK_INSTALL_CMD / dork_install_deps in .dork.sh."
+    fi
+  done <<< "$plan"
 }
 
 # The command the dev pane runs, echoed (empty = no dev server; the pane
@@ -229,6 +292,18 @@ dev_command_for() {
     [[ -f "$REPO_ROOT/bun.lockb" || -f "$REPO_ROOT/bun.lock" ]] && pm="bun"
     echo "PORT=$port $pm run dev"
     return
+  fi
+  # No root dev script. If a nested package.json has one, say so rather than
+  # silently opening a plain shell: dork can't know how it should be started
+  # (cd into it? a Makefile target? alongside a backend?).
+  local nested
+  nested="$(git -C "$REPO_ROOT" ls-files -- '*/package.json' 2>/dev/null \
+    | while IFS= read -r f; do
+        grep -q '"dev"[[:space:]]*:' "$REPO_ROOT/$f" 2>/dev/null && echo "${f%/package.json}"
+      done | head -3 | paste -sd, - | sed 's/,/, /g')"
+  if [[ -n "$nested" ]]; then
+    echo >&2 "[dork] No dev command: no dev script at the repo root, but found one in: $nested."
+    echo >&2 "[dork] Set DORK_DEV_CMD (e.g. 'cd <dir> && PORT={port} npm run dev') in .dork.sh."
   fi
   echo ""
 }
@@ -1294,8 +1369,10 @@ cmd_init() {
 #DORK_DEV_CMD='PORT={port} pnpm dev'
 #dork_dev_command() { echo "PORT=$1 pnpm dev"; }
 
-# Dependency install for a fresh worktree. Default: auto-detected from the
-# lockfile (pnpm/yarn/npm/bun/uv/poetry/bundler).
+# Dependency install for a fresh worktree. Default: every tracked lockfile
+# (pnpm/yarn/npm/bun/uv/poetry/bundler) up to DORK_LOCKFILE_DEPTH levels deep
+# (default 2) is installed in its own directory. Set a command to run at the
+# root instead, or define dork_install_deps() for full control.
 #DORK_INSTALL_CMD='pnpm install --frozen-lockfile'
 
 # Env files copied from the repo root into each worktree.
@@ -1444,6 +1521,7 @@ case "$1" in
   new)         shift; repo_required; cmd_new_or_tile "" "$@" ;;
   yolo)        shift; repo_required; cmd_new_or_tile yolo "$@" ;;
   _init-port)  shift; repo_required; cmd_init_port "$@" ;;
+  _install-plan) shift; repo_required; resolve_install_plan "${1:-$REPO_ROOT}" ;;
   sync)        shift; repo_required; cmd_sync "$@" ;;
   pr)          shift; repo_required; cmd_pr "$@" ;;
   kill)        shift; repo_required; cmd_kill "$@" ;;

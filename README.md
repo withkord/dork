@@ -121,10 +121,22 @@ worktree: resolve there, `git rebase --continue`, re-run sync.
 ## Configuration (`.dork.sh`)
 
 A plain bash file at the repo root, sourced by dork. Commit it. All keys are
-optional — with no config at all, dork auto-detects the package manager from
-the lockfile, runs `PORT=<port> <pm> run dev` when `package.json` has a `dev`
-script, copies `.env` / `.env.local` into each worktree, and uses ports
-3001–3008.
+optional — with no config at all, dork installs dependencies for every tracked
+lockfile it finds (see below), runs `PORT=<port> <pm> run dev` when the root
+`package.json` has a `dev` script, copies `.env` / `.env.local` into each
+worktree, and uses ports 3001–3008.
+
+**Dependency detection.** dork looks for tracked lockfiles (`pnpm-lock.yaml`,
+`yarn.lock`, `bun.lock[b]`, `package-lock.json`, `uv.lock`, `poetry.lock`,
+`Gemfile.lock`) at the root and up to two directories deep, and runs the
+matching install in each lockfile's own directory. So a Python backend at the
+root with an npm frontend in `web/` gets `uv sync` *and* `(cd web && npm ci)`.
+Per directory it runs at most one JS install (pnpm > yarn > bun > npm), one
+Python install and one Ruby install. Nested JS lockfiles under a directory
+that already has one are skipped, since a workspace root install covers its
+packages. It prints what it found (`[dork] Detected: uv (.), npm (web)`); a
+failed install is reported and the rest still run. If the dev script lives
+in a subdirectory, dork says so and asks you to set `DORK_DEV_CMD`.
 
 ```sh
 # Port range — give each of your projects a distinct range so parallel
@@ -137,9 +149,13 @@ DORK_DEV_CMD='PORT={port} pnpm dev'
 # …or a function, for anything dynamic:
 #dork_dev_command() { echo "uv run uvicorn main:app --reload --port $1"; }
 
-# Dependency install for a fresh worktree (auto-detected from the lockfile:
-# pnpm / yarn / npm / bun / uv / poetry / bundler).
+# Dependency install for a fresh worktree (auto-detected from every tracked
+# lockfile, see above). A command here runs at the root and replaces detection;
+# a dork_install_deps function (arg: worktree path) replaces both.
 #DORK_INSTALL_CMD='pnpm install --frozen-lockfile'
+#dork_install_deps() { uv sync && (cd web && npm ci); }
+# How deep detection looks for lockfiles (default 2; 0 = root only).
+#DORK_LOCKFILE_DEPTH=2
 
 # Env files copied into each worktree (default: .env .env.local).
 #DORK_ENV_FILES='.env .env.local'
@@ -306,6 +322,8 @@ the new `.gitignore` entry.
 
 ## Notes & limitations
 
+- `test/install-detect.sh` covers dependency detection against throwaway repos
+  (needs only git).
 - Worktrees live under `.dork/worktrees/<port>` inside the repo (gitignored);
   the port doubles as the worktree/branch id.
 - Pane tiling drives Ghostty via AppleScript (macOS) or tmux (anywhere). In
