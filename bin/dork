@@ -31,7 +31,7 @@
 #
 set -euo pipefail
 
-DORK_VERSION="0.5.2"
+DORK_VERSION="0.5.3"
 
 # Absolute path of this script + the dork checkout that contains it.
 _SRC="${BASH_SOURCE[0]}"
